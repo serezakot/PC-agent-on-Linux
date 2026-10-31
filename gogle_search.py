@@ -1,48 +1,49 @@
 #!/usr/bin/env python3
-"""Вводишь запрос как в поисковике -> открывается первый сайт в Firefox.
-А если написать «сайт [запрос]» — запрос ищется ВНУТРИ этого сайта.
+"""Пишешь команду обычными словами -> наша модель (папка ml/) понимает, что и где искать -> открывается Firefox.
 
-Обычный запрос
---------------
-Используется режим Google «Мне повезёт» (btnI=1): Google сам перенаправляет
-на первый результат, поэтому запрос мы не разбираем и не исправляем.
-Google при таком переходе часто показывает страницу «Redirect Notice»
-(google.com/url?q=...). Чтобы её не видеть, скрипт сам спрашивает у Google,
-куда он перенаправляет, берёт оттуда адрес сайта и открывает сразу его.
-Если это не вышло — открывается обычная ссылка через Google.
+    открой ютуб и найди linkin park       -> поиск «linkin park» внутри YouTube
+    запусти саунд клауд                    -> просто открыть сайт
+    загугли рецепт борща                   -> страница результатов Google (именно поиск, а не первый сайт)
+    переведи на английский как дела        -> Google Переводчик с уже подставленным текстом и языком
+    кто такой павел дуров                  -> это не для браузера: «llm», браузер не открывается
 
-Поиск внутри сайта: «название [запрос]»
----------------------------------------
-Запрос всегда пишется в квадратных скобках, поэтому угадывать, где кончается
-название сайта и начинается запрос, не нужно. Всё, что до первой «[» — название
-сайта, всё между первой «[» и последней «]» — запрос.
+Никаких скобок и особого синтаксиса: сайт, запрос, текст и язык перевода выделяет обученная модель.
 
-    саундклауд [9mice]
-    ютуб [linkin park]
-    hugging face [bert]
+Сайт не назван, есть запрос («загугли …», «поищи в интернете …», «включи …»)
+------------------------------------------------------------------------------
+Открывается страница результатов Google: https://www.google.com/search?q=запрос. Раньше здесь стоял режим «Мне повезёт»
+(btnI=1) — он сам уводил на первый сайт из выдачи, поэтому «загугли» не гуглил. Теперь «Мне повезёт» используется
+только для одного: узнать, какой сайт имелся в виду, когда пользователь назвал его («ютуб», «алиэкспресс»).
+Если Google не ответил на такой вопрос — открывается ссылка «Мне повезёт» через Google (может появиться страница
+«Redirect Notice»).
 
-Заранее заготовленных адресов поиска НЕТ. Как искать на сайте, скрипт выясняет
-сам, из страницы этого сайта:
+Перевод (route == "translate")
+------------------------------
+Открывается Google Переводчик: translate.google.com/?sl=auto&tl=<язык>&text=<текст>&op=translate. Язык перевода
+даёт модель. Если он не назван («переведи привет»), берётся по тексту: кириллица -> английский, латиница -> русский.
+
+Поиск внутри сайта (модель выделила и сайт, и запрос)
+------------------------------------------------------
+Заранее заготовленных адресов поиска НЕТ. Как искать на сайте, скрипт выясняет сам, из страницы этого сайта:
   1) название сайта отправляется в Google («Мне повезёт») -> получаем страницу сайта;
-  2) скачиваем эту страницу (если на ней поиска нет — главную страницу сайта)
-     и ищем, как сайт сам описывает свой поиск. Три способа, по убыванию надёжности:
-       • OpenSearch  — <link rel="search" type="application/opensearchdescription+xml">:
-                       тот самый стандарт, по которому Firefox добавляет «поисковые системы»;
-       • SearchAction — разметка schema.org в JSON-LD (поле поиска для Google);
-       • форма поиска — обычная <form method="get"> с полем ввода (так устроены
-                       WordPress, MediaWiki, Discourse, Яндекс и очень многие другие);
+  2) скачиваем эту страницу (если на ней поиска нет — главную) и ищем, как сайт сам описывает свой поиск:
+       • OpenSearch  — <link rel="search" type="application/opensearchdescription+xml">;
+       • SearchAction — разметка schema.org в JSON-LD;
+       • форма поиска — обычная <form method="get"> с полем ввода;
   3) нашли — подставляем запрос в найденный адрес и открываем;
-  4) не нашли (сайт целиком на JavaScript, поиск через POST и т. п.) — спрашиваем
-     Google «site:домен запрос»;
+  4) не нашли — спрашиваем Google «site:домен запрос»;
   5) Google не ответил — открывается обычная ссылка через Google.
-Найденное запоминается до конца работы программы, повторный поиск по тому же
-сайту идёт без скачивания страницы.
+Найденное запоминается до конца работы программы.
 
-Запуск (в оболочке скобки лучше брать в кавычки):
-    python3 gogle_search.py                          # интерактивный режим
-    python3 gogle_search.py ютуб                     # обычный запрос
-    python3 gogle_search.py "саундклауд [9mice]"     # поиск внутри сайта
-    python3 gogle_search.py --dry-run "ютуб [rock]"  # только показать ссылку (без сети)
+Модель
+------
+Лежит в ml/ml_model/ (её создаёт обучение: cd ml && python3 ml_train.py --mode final). Модель лениво грузится при
+первой команде. Нет модели — программа так и скажет. Нужны torch и transformers (pip install -r requirements.txt).
+
+Запуск:
+    python3 gogle_search.py                                  # диалог
+    python3 gogle_search.py "открой ютуб и найди linkin park"
+    python3 gogle_search.py --dry-run "открой ютуб и найди linkin park"   # только показать ссылку (без сети и браузера)
 """
 import json
 import re
@@ -56,10 +57,12 @@ import xml.etree.ElementTree as ET
 import zlib
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from pathlib import Path
 from urllib.parse import (parse_qs, quote, quote_plus, urlencode, urljoin, urlparse,
                           urlsplit, urlunsplit)
 
 SEARCH_URL = "https://www.google.com/search"
+TRANSLATE_URL = "https://translate.google.com/"
 EXIT_WORDS = {"exit", "выход"}
 LAUNCH_WAIT_SECONDS = 3.0
 HTTP_TIMEOUT_SECONDS = 6.0
@@ -95,32 +98,44 @@ def normalize_query(text: str) -> str:
 
 
 def build_url(query: str) -> str:
-    """Ссылка «Мне повезёт» для запроса. Кодирование в UTF-8 делает urlencode."""
+    """Ссылка «Мне повезёт» (btnI=1): Google сам уводит на первый результат. Нужна только для того, чтобы
+    узнать, какой сайт имелся в виду; пользователю такую ссылку не открываем. Кодирование в UTF-8 делает urlencode."""
     return SEARCH_URL + "?" + urlencode({"q": normalize_query(query), "btnI": "1"})
 
 
+def search_url(query: str) -> str:
+    """Обычная страница результатов Google (без «Мне повезёт»): то, что открывается на «загугли»."""
+    return SEARCH_URL + "?" + urlencode({"q": normalize_query(query)})
+
+
 # =============================================================================
-# Разбор ввода «название [запрос]»
+# Перевод
 # =============================================================================
-def parse_input(text: str) -> tuple[str, str | None]:
-    """«название [запрос]» -> (название, запрос).
-
-    Название — всё до первой «[». Запрос — всё между первой «[» и последней «]»
-    (вложенные скобки допустимы). Нет закрывающей «]» — запрос берётся до конца
-    строки. Текст после последней «]» отбрасывается.
-    Нет «[» вообще -> (весь текст, None): это обычный запрос.
-    """
-    start = text.find("[")
-    if start == -1:
-        return normalize_query(text), None
-    name = normalize_query(text[:start])
-    rest = text[start + 1:]
-    end = rest.rfind("]")
-    if end != -1:
-        rest = rest[:end]
-    return name, normalize_query(rest)
+# Коды наших языков (ml_spec.LANGS) -> коды Google Переводчика. Остальные совпадают.
+_TRANSLATE_CODES = {"zh": "zh-CN", "he": "iw"}
+_CYRILLIC = re.compile(r"[\u0400-\u04FF]")
+_LATIN = re.compile(r"[A-Za-z]")
 
 
+def target_language(text: str, lang: str = "none") -> str:
+    """Язык, НА который переводим. Назван — берём его; не назван («none») — угадываем по тексту:
+    больше кириллицы -> en, есть латиница -> ru, иначе (цифры, значки) -> en."""
+    if lang and lang != "none":
+        return _TRANSLATE_CODES.get(lang, lang)
+    cyrillic, latin = len(_CYRILLIC.findall(text)), len(_LATIN.findall(text))
+    return "ru" if latin > cyrillic else "en"
+
+
+def translate_url(text: str, lang: str = "none") -> str:
+    """Google Переводчик с подставленными текстом и языком. Исходный язык определяет сам переводчик (sl=auto)."""
+    text = normalize_query(text)
+    params = {"sl": "auto", "tl": target_language(text, lang), "text": text, "op": "translate"}
+    return TRANSLATE_URL + "?" + urlencode(params, quote_via=quote)   # пробел -> %20 (так надёжнее, чем «+»)
+
+
+# =============================================================================
+# Адрес сайта
+# =============================================================================
 def site_host(url: str) -> str:
     """Домен сайта без «www.», «m.», «mobile.»: https://www.youtube.com/x -> youtube.com."""
     host = (urlparse(url).hostname or "").lower()
@@ -566,11 +581,12 @@ class Plan:
     """Что открывать и почему.
 
     kind:
-      plain        — обычный запрос, открыт найденный сайт
-      fallback     — Google не ответил, открыта ссылка «Мне повезёт» через Google
-      site_home    — «сайт []»: открыта главная найденного сайта
-      site_search  — открыт поиск, найденный на самом сайте (source: opensearch / jsonld / form)
-      google_site  — на сайте поиск не нашёлся, результат получен через «site:домен запрос»
+      google_search — сайт не назван (или назван сам Google): страница результатов Google по запросу
+      translate     — Google Переводчик (term — текст, source — код языка перевода)
+      fallback      — Google не ответил, открыта ссылка «Мне повезёт» через Google
+      site_home     — только сайт: открыта главная найденного сайта
+      site_search   — открыт поиск, найденный на самом сайте (source: opensearch / jsonld / form)
+      google_site   — на сайте поиск не нашёлся, результат получен через «site:домен запрос»
     """
     kind: str
     url: str
@@ -650,44 +666,54 @@ def resolve_target(lucky_url: str, fetch=None) -> str | None:
     return None
 
 
-def _plain_plan(query: str, resolver) -> Plan:
-    lucky_url = build_url(query)
-    found = resolver(lucky_url)
-    return Plan("plain", found) if found else Plan("fallback", lucky_url)
+def _is_google_root(url: str) -> bool:
+    """Главная страница самого Google (google.com, google.bg/?hl=ru…), а не Карты, Диск или Gmail."""
+    parts = urlparse(url)
+    host = (parts.hostname or "").lower()
+    # именно google.<домен> или www.google.<домен>: mail.google.com (Gmail), maps.google.com и т.п. — не поиск
+    return bool(re.fullmatch(r"(www\.)?google\.[a-z.]+", host)) and parts.path in ("", "/", "/webhp")
 
 
-def make_plan(text: str, resolver=None, finder=None) -> Plan | None:
-    """Решает, какой адрес открыть. None — вводить нечего (пустой ввод).
+def make_translate_plan(text: str, lang: str = "none") -> Plan | None:
+    """Google Переводчик для (текст, язык перевода). None — переводить нечего."""
+    text = normalize_query(text or "")
+    if not text:
+        return None
+    return Plan("translate", translate_url(text, lang), term=text, source=target_language(text, lang))
 
-    resolver(lucky_url) -> адрес сайта или None; по умолчанию resolve_target.
-    finder(page_url) -> (шаблон, способ) или None; по умолчанию find_search_template.
+
+def make_plan(site: str, query: str = "", resolver=None, finder=None) -> Plan | None:
+    """Решает, какой адрес открыть. None — искать нечего (и сайт, и запрос пустые).
+
+    site и query приходят от модели. resolver(lucky_url) -> адрес сайта или None (по умолчанию resolve_target);
+    finder(page_url) -> (шаблон, способ) или None (по умолчанию find_search_template).
     """
     resolver = resolver or resolve_target
     finder = finder or find_search_template
-    name, term = parse_input(text)
-    if term is None:                      # обычный запрос, без скобок
-        return _plain_plan(name, resolver) if name else None
-    if not name:                          # «[запрос]» — название не указано
-        return _plain_plan(term, resolver) if term else None
+    site, query = normalize_query(site or ""), normalize_query(query or "")
+    if not site:                          # сайт не назван — настоящий поиск в Google (страница результатов)
+        return Plan("google_search", search_url(query), term=query) if query else None
 
-    home = resolver(build_url(name))      # 1. какой сайт имелся в виду
+    home = resolver(build_url(site))      # 1. какой сайт имелся в виду
     if not home:
-        whole = f"{name} {term}".strip()
-        return Plan("fallback", build_url(whole), term=term or None)
+        whole = f"{site} {query}".strip()
+        return Plan("fallback", build_url(whole), term=query or None)
     host = site_host(home)
-    if not term:                          # «сайт []» — просто открыть сайт
+    if not query:                         # только сайт — просто открыть
         return Plan("site_home", home, host)
+    if _is_google_root(home):             # «открой гугл и найди X» — это обычный поиск Google
+        return Plan("google_search", search_url(query), host, query)
 
     found = finder(home)                  # 2. как искать на этом сайте — узнаём у самого сайта
     if found:
         template, source = found
-        return Plan("site_search", fill_template(template, term), host, term, source)
+        return Plan("site_search", fill_template(template, query), host, query, source)
 
-    site_query = f"site:{host} {term}"    # 3. поиск на сайте не нашёлся — через Google
+    site_query = f"site:{host} {query}"   # 3. поиск на сайте не нашёлся — через Google
     google_result = resolver(build_url(site_query))
     if google_result:
-        return Plan("google_site", google_result, host, term)
-    return Plan("fallback", build_url(site_query), host, term)   # 4. запасной вариант
+        return Plan("google_site", google_result, host, query)
+    return Plan("fallback", build_url(site_query), host, query)   # 4. запасной вариант
 
 
 # =============================================================================
@@ -744,22 +770,14 @@ def open_in_browser(url: str) -> None:
     raise BrowserError("; ".join(errors))
 
 
-def open_first_result(query: str, opener=open_in_browser, resolver=None, finder=None) -> str | None:
-    """Открывает результат. Возвращает открытую ссылку или None для пустого запроса.
-
-    Понимает и обычный запрос, и «сайт [запрос]» (см. make_plan).
-    """
-    plan = make_plan(query, resolver, finder)
-    if plan is None:
-        return None
-    opener(plan.url)
-    return plan.url
-
-
 _SOURCE_NAMES = {"opensearch": "OpenSearch", "jsonld": "SearchAction", "form": "форма поиска"}
 
 
 def _describe(plan: Plan) -> str:
+    if plan.kind == "google_search":
+        return f"Ищу в Google «{plan.term}»: {plan.url}"
+    if plan.kind == "translate":
+        return f"Перевожу на {plan.source} в Google Переводчике «{plan.term}»: {plan.url}"
     if plan.kind == "site_home":
         return f"Открываю сайт {plan.site}: {plan.url}"
     if plan.kind == "site_search":
@@ -776,17 +794,94 @@ def _describe(plan: Plan) -> str:
     return f"Открываю: {plan.url}"
 
 
-def _handle(query: str, opener, dry_run: bool) -> bool:
-    """Обрабатывает один запрос. True — всё хорошо (или запрос пустой)."""
-    resolver = (lambda url: None) if dry_run else None  # --dry-run: без сети
-    plan = make_plan(query, resolver)
-    if plan is None:
-        return True
+# =============================================================================
+# Модель: фраза -> что делать
+# =============================================================================
+ML_DIR = Path(__file__).resolve().parent / "ml"
+
+
+class ModelError(RuntimeError):
+    """Обученной модели нет или она не загрузилась."""
+
+
+def model_parse(phrase: str) -> dict:
+    """Фраза -> решение модели: {"route": browser|translate|llm, "site", "query", "text", "lang", "fallback", ...}.
+
+    Тяжёлые torch/transformers грузятся только здесь, при первой команде. Журнал команд (ML_PARSE_LOG=1) пишется сам.
+    """
+    if not (ML_DIR / "ml_model" / "heads.pt").exists():
+        raise ModelError(f"нет обученной модели: {ML_DIR / 'ml_model'}. Положите сюда папку ml_model "
+                         "или обучите: cd ml && python3 ml_gen.py --mode final && python3 ml_train.py --mode final")
+    if str(ML_DIR) not in sys.path:
+        sys.path.insert(0, str(ML_DIR))
     try:
+        import ml_infer
+        import ml_log
+    except ImportError as exc:
+        raise ModelError(f"не хватает пакета для модели ({exc}). Установите: pip install -r requirements.txt") from exc
+    result = ml_infer.get_engine().predict_one(phrase)
+    ml_log.log_result(result)
+    return result
+
+
+def open_first_result(site: str, query: str = "", opener=open_in_browser, resolver=None, finder=None) -> str | None:
+    """Открывает результат для (сайт, запрос). Возвращает открытую ссылку или None, если искать нечего."""
+    plan = make_plan(site, query, resolver, finder)
+    if plan is None:
+        return None
+    opener(plan.url)
+    return plan.url
+
+
+def handle_phrase(phrase: str, parser=model_parse, opener=open_in_browser, resolver=None, finder=None):
+    """Одна фраза от начала до конца. Возвращает (решение модели, план или None).
+
+    browser   -> поиск в Google / сайт / поиск на сайте;
+    translate -> Google Переводчик с подставленными текстом и языком;
+    llm       -> браузер не открывается (эта ветка ещё не подключена), план None.
+    """
+    result = parser(phrase)
+    route = result.get("route")
+    if route == "browser":
+        plan = make_plan(result.get("site", ""), result.get("query", ""), resolver, finder)
+    elif route == "translate":
+        plan = make_translate_plan(result.get("text", ""), result.get("lang", "none"))
+    else:
+        return result, None
+    if plan is not None:
         opener(plan.url)
+    return result, plan
+
+
+def _show_model(result: dict) -> str:
+    route = result.get("route")
+    extra = {"browser": f"сайт={result.get('site') or '—'}, запрос={result.get('query') or '—'}",
+             "translate": f"текст={result.get('text')!r}, язык={result.get('lang')}",
+             "llm": "отправляю большой LLM (пока не подключена)"}.get(route, "")
+    note = f"  [страховка: {result['reason']}]" if result.get("fallback") else ""
+    return f"модель: {route} · {extra}{note}"
+
+
+def _run(phrase: str, opener, dry_run: bool) -> bool:
+    """Обрабатывает одну фразу. True — всё хорошо (или фраза пустая)."""
+    if not normalize_query(phrase):
+        return True
+    resolver = (lambda url: None) if dry_run else None      # --dry-run: без сети
+    try:
+        result, plan = handle_phrase(phrase, model_parse, opener, resolver)
+    except ModelError as exc:
+        print(f"Ошибка: {exc}")
+        return False
     except BrowserError as exc:
         print(f"Ошибка: не удалось открыть браузер — {exc}")
         return False
+    print(_show_model(result))
+    if plan is None:
+        if result.get("route") == "browser":
+            print("Искать нечего.")
+        elif result.get("route") == "translate":
+            print("Переводить нечего.")
+        return True
     print(plan.url if dry_run else _describe(plan))
     return True
 
@@ -796,23 +891,32 @@ def main(argv: list[str]) -> int:
     args = [a for a in argv if a != "--dry-run"]
     opener = (lambda url: None) if dry_run else open_in_browser
 
-    if args:  # запрос передан аргументами
+    if args:  # фраза передана аргументами
         text = " ".join(args)
-        if make_plan(text, lambda url: None) is None:
+        if not normalize_query(text):
             print("Пустой запрос.")
             return 1
-        return 0 if _handle(text, opener, dry_run) else 1
+        return 0 if _run(text, opener, dry_run) else 1
 
-    print("Введи запрос или «сайт [запрос]» (exit или выход — закрыть).")
+    try:
+        sys.stdin.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    try:
+        import readline  # noqa: F401
+    except ImportError:
+        pass
+
+    print("Скажи команду обычными словами (exit или выход — закрыть).")
     while True:
         try:
-            query = input("> ")
+            query = input("> ").replace("\ufffd", "")
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
         if normalize_query(query).lower() in EXIT_WORDS:
             return 0
-        _handle(query, opener, dry_run)
+        _run(query, opener, dry_run)
 
 
 if __name__ == "__main__":

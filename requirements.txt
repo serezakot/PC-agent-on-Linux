@@ -1,0 +1,5 @@
+# gogle_search.py и router.py — только стандартная библиотека.
+# Парсер на модели (папка ml/):
+torch
+transformers
+pytest
