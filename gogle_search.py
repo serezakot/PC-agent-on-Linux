@@ -37,8 +37,8 @@
 
 Модель
 ------
-Лежит в ml/ml_model/ (её создаёт обучение: cd ml && python3 ml_train.py --mode final). Модель лениво грузится при
-первой команде. Нет модели — программа так и скажет. Нужны torch и transformers (pip install -r requirements.txt).
+Лежит в ml/ml_model/ (или рядом в ml_model/, её создаёт обучение: python3 ml_train.py --mode final --arch small).
+Модель лениво грузится при первой команде. Нет модели — программа так и скажет. Нужны torch и transformers.
 
 Запуск:
     python3 gogle_search.py                                  # диалог
@@ -797,7 +797,8 @@ def _describe(plan: Plan) -> str:
 # =============================================================================
 # Модель: фраза -> что делать
 # =============================================================================
-ML_DIR = Path(__file__).resolve().parent / "ml"
+_HERE = Path(__file__).resolve().parent
+ML_DIR = _HERE if (_HERE / "ml_model" / "heads.pt").exists() or (_HERE / "ml_infer.py").exists() else _HERE / "ml"
 
 
 class ModelError(RuntimeError):
@@ -807,30 +808,22 @@ class ModelError(RuntimeError):
 def model_parse(phrase: str) -> dict:
     """Фраза -> решение модели: {"route": browser|translate|llm, "site", "query", "text", "lang", "fallback", ...}.
 
-    Тяжёлые torch/transformers грузятся только здесь, при первой команде. Журнал команд (ML_PARSE_LOG=1) пишется сам.
+    Тяжёлые torch/transformers грузятся только здесь, при первой команде. Журнал команд (parse_log.jsonl) пишется сам.
     """
-    if not (ML_DIR / "ml_model" / "heads.pt").exists():
-        raise ModelError(f"нет обученной модели: {ML_DIR / 'ml_model'}. Положите сюда папку ml_model "
-                         "или обучите: cd ml && python3 ml_gen.py --mode final && python3 ml_train.py --mode final")
-    if str(ML_DIR) not in sys.path:
-        sys.path.insert(0, str(ML_DIR))
+    ml_dir = _HERE if (_HERE / "ml_model" / "heads.pt").exists() else ML_DIR
+    if not (ml_dir / "ml_model" / "heads.pt").exists():
+        raise ModelError(f"нет обученной модели: {ml_dir / 'ml_model'}. Положите сюда папку ml_model "
+                         "или обучите: python3 ml_gen.py --mode final && python3 ml_train.py --mode final --arch small")
+    if str(ml_dir) not in sys.path:
+        sys.path.insert(0, str(ml_dir))
     try:
         import ml_infer
         import ml_log
     except ImportError as exc:
         raise ModelError(f"не хватает пакета для модели ({exc}). Установите: pip install -r requirements.txt") from exc
-    result = ml_infer.get_engine().predict_one(phrase)
+    result = ml_infer.get_engine(str(ml_dir / "ml_model")).predict_one(phrase)
     ml_log.log_result(result)
     return result
-
-
-def open_first_result(site: str, query: str = "", opener=open_in_browser, resolver=None, finder=None) -> str | None:
-    """Открывает результат для (сайт, запрос). Возвращает открытую ссылку или None, если искать нечего."""
-    plan = make_plan(site, query, resolver, finder)
-    if plan is None:
-        return None
-    opener(plan.url)
-    return plan.url
 
 
 def handle_phrase(phrase: str, parser=model_parse, opener=open_in_browser, resolver=None, finder=None):
@@ -838,7 +831,7 @@ def handle_phrase(phrase: str, parser=model_parse, opener=open_in_browser, resol
 
     browser   -> поиск в Google / сайт / поиск на сайте;
     translate -> Google Переводчик с подставленными текстом и языком;
-    llm       -> браузер не открывается (эта ветка ещё не подключена), план None.
+    остальное -> браузер не открывается (эта ветка ещё не подключена), план None.
     """
     result = parser(phrase)
     route = result.get("route")
@@ -857,7 +850,9 @@ def _show_model(result: dict) -> str:
     route = result.get("route")
     extra = {"browser": f"сайт={result.get('site') or '—'}, запрос={result.get('query') or '—'}",
              "translate": f"текст={result.get('text')!r}, язык={result.get('lang')}",
-             "llm": "отправляю большой LLM (пока не подключена)"}.get(route, "")
+             "llm": "отправляю большой LLM (пока не подключена)"}.get(
+                 route, "отправляю большой LLM (пока не подключена)"
+             )
     note = f"  [страховка: {result['reason']}]" if result.get("fallback") else ""
     return f"модель: {route} · {extra}{note}"
 

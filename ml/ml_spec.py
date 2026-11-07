@@ -1,184 +1,228 @@
-"""Контракт парсера первого слоя: что он понимает и как это размечается (без torch).
+"""Contract of the first-layer parser: what it understands and how phrases are labelled (no torch needed).
 
-Первый слой JARVIS — маленькая обученная модель. Она за ~20 мс решает, что хочет пользователь,
-и достаёт из фразы нужные куски. Всё сложное она отдаёт большой LLM (второй слой).
+The first layer of the voice assistant is a small trained model. In ~3-15 ms on CPU (e.g. AMD Ryzen 7 7840HS)
+it decides what the user wants and pulls the needed pieces out of the phrase. Anything complicated is handed
+to the big LLM (second layer). The commands themselves are Russian (they come from speech recognition); all
+examples below are Russian on purpose.
 
-ТРИ НАМЕРЕНИЯ (intent)
-  browser   — во фразе есть команда для браузера: открой / запусти / зайди / перейди / включи /
-              поставь / найди / поищи / покажи / посмотри / узнай / погугли / загугли ...
-              Куски: SITE (какой сайт, если назван) и QUERY (что искать, если сказано).
-              Нет сайта, но названо «где искать» (гугл / интернет / сеть / поиск / браузер, или «погугли X»)
-              -> обычный поиск в Google. «Включи / поставь X» (музыка, фильм) без площадки — тоже поиск в Google.
-              Есть только сайт -> открыть сайт. Есть оба -> сайт с запросом.
-  translate — «переведи ...», «как будет X по-английски», «как сказать X на немецком».
-              Куски: TEXT (что переводить, дословно) и язык ПЕРЕВОДА (отдельная голова: код из LANGS,
-              «none», если язык не назван). Исходный язык не нужен: переводчики определяют его сами.
-  llm       — всё остальное: вопросы, просьбы рассказать/объяснить/написать/посчитать,
-              болтовня. Если команды для браузера нет — это не к браузеру, а к большой LLM.
+FIVE INTENTS (ROUTES)
+  browser   - web sites, web services, plain Google/web searches, media playback without a named platform,
+              and light factual searches (weather, currency rates/conversion, flight/train tickets & schedules).
+              Also hybrid apps when explicitly requested in the browser ("открой телеграм в вебе / на сайте / в браузере").
+              Pieces: SITE (which site, if named) and QUERY (what to search for / play, if said).
+  app       - desktop applications, hybrid apps (telegram, steam, spotify, discord, claude, whatsapp, etc. without
+              a web marker), system utilities (calculator, notepad, terminal, settings, explorer/files), local folders,
+              drives and files ("открой калькулятор", "открой телеграм", "открой загрузки и отсортируй по дате").
+              Pieces: SITE (the application, folder, drive or file name) and QUERY (optional inner query or action).
+  system    - lightweight PC / OS control commands ("выключи комп", "переведи в спящий режим", "сделай скриншот",
+              "сверни все окна", "очисти корзину", "создай папку для отчётов", "удали файл отчёт").
+              Pieces: QUERY (the system action/command span), SITE is empty.
+  translate - "переведи ...", "переведи: ...", "переведи как будет X на английском", "как будет X по-английски",
+              "как сказать X на немецком", "как переводится X".
+              Pieces: TEXT (what to translate, verbatim) and the TARGET language (a separate head: a code from
+              LANGS, "none" if no language was named).
+  llm       - everything else: complex questions, explanations ("скажи в чём разница между X и Y",
+              "скажи погоду на завтра в 12"), smart home and appliances ("включи будильник", "включи свет",
+              "включи чайник"), vague goals ("давай зайдём на гитхаб, мне нужно посмотреть один репозиторий"),
+              and any phrase where the model is unsure (fallback=True).
 
-РАЗМЕТКА СЛОВ (tags): O — мусор, SITE, QUERY, TEXT. Слова не меняются никогда: модель только
-ставит метки словам исходной фразы, а site/query/text собираются из этих же слов.
+WORD TAGS (tags): O - noise, SITE, QUERY, TEXT. Words are never changed: the model only puts labels on the
+words of the original phrase, and site/query/text are assembled from those very words.
 
-ПРАВИЛА (их можно и нужно поправить — от них зависит качество; всё, что здесь записано, генератор
-данных выполняет одинаково везде)
-  1. Команды, вежливость, обращение к ассистенту («джарвис», «пожалуйста», «ну», «плиз») — O.
-  2. Предлог перед сайтом («на», «в», «через») и слова «сайт», «страница», «приложение» — O.
-     Исключение: предлог, который сам входит в название, — SITE.
-  3. Название сайта из нескольких слов — все слова SITE («яндекс карты», «саунд клауд»).
-     Название пишется как сказано: падеж, опечатки и язык не трогаются.
-  4. «Погугли / загугли / нагугли / поищи в гугле / поищи в интернете X» — browser без сайта:
-     «в гугле», «в интернете», «в сети» — O. «Открой гугл» — открыть сайт: «гугл» — SITE.
-  5. QUERY — непрерывный кусок: всё, что описывает объект поиска, включая предлоги внутри
-     («чехол для телефона», «комнату в софии»), фильтры («за час», «новые»). Команда («найди»,
-     «включи») в QUERY никогда не входит, даже «и включи radiohead».
-  6. «Включи / поставь X» без названного сайта — QUERY (browser без сайта).
-     «Открой / запусти / зайди на X» — X всегда SITE, даже незнакомое.
-  7. Название сайта внутри самого вопроса («найди как отключить рекламу в ютубе», «найди отзывы
-     о ютуб премиум») — часть QUERY, а не SITE. Для фраз «найди <вопрос> на/в сайте» однозначного
-     правила нет: такие фразы в обучение не входят, а при сомнении модель отдаёт фразу большой LLM.
-  8. Вопросы и просьбы без команды браузера («кто такой павел первый», «что такое гитхаб»,
-     «расскажи про чёрные дыры», «как дела») — llm, даже если в них названы сайты.
-  9. translate: TEXT — всё, что надо перевести, дословно (даже если это похоже на команду:
-     «переведи на английский открой ютуб» -> TEXT «открой ютуб»). Слова «слово», «фразу», «на
-     английский», «с русского», «по-английски» — O.
- 10. Если модель не уверена (низкая вероятность или странная разметка) — llm.
- 11. ГДЕ ИСКАТЬ. «Найди / поищи / ищи / покажи / посмотри / глянь / узнай / вбей / сделай запрос X» без
-     указания места поиска (ни сайта, ни «в гугле», «в интернете», «в сети», «в поиске», «в браузере») — llm:
-     «найди формулу площади круга» -> llm, а «найди в гугле формулу площади круга» и «найди формулу
-     площади круга на википедии» -> browser. «Погугли / загугли» уже содержат место. Название сайта внутри
-     самого вопроса («найди как отключить рекламу в ютубе») местом не считается -> llm.
-     «Включи / поставь X» (музыка, фильм) — не поиск, правило 6 остаётся: browser без сайта.
- 12. Быт и техника (свет, шторы, будильник, таймер, напоминание, звонок, смс, телевизор, климат, бытовая
-     техника, «как…»-вопросы) — llm, даже если команда выглядит как «включи / открой / запусти / поставь».
-     Системные задачи компьютера (калькулятор, блокнот, папки, файлы, окна, скриншот, выключение и
-     перезагрузка ПК, запуск скриптов) — тоже не браузер и не перевод -> llm. В данных это отдельная
-     категория (шаблон llm.system, файлы system*.txt), с бытом она не смешивается.
- 13. «Пожалуйста» / «плиз» в переводе. Сразу после команды («переведи пожалуйста …») или перед ней — O.
-     После переводимого текста («переведи на чешский два чая пожалуйста») и внутри него («как сказать помогите
-     пожалуйста по-английски») — часть TEXT: переводчик получит фразу вместе с вежливым словом.
-     Язык-наречие «по болгарски» внутри переводимой фразы («я не говорю по болгарски») тоже TEXT; тот «по X»,
-     которым назван язык ПЕРЕВОДА, — O.
- 14. «Что значит / что означает X». Без указания языка («что означает выражение by the way») — просьба объяснить, это llm.
-     С языком («что значит слово gorgeous на русском», «что значит awkward по-русски») — translate.
- 15. Глаголы-действия между сайтом и запросом («на вольфрам альфа реши интеграл», «в спидтесте проверь пинг»,
-     «на десмосе построй график») — O, а не QUERY. Если сайта и места поиска нет («реши уравнение», «закажи пиццу»,
-     «проверь пинг») — llm. Если разметка получилась рваной (кусок SITE / QUERY / TEXT разорван словами другой
-     метки) — модель ошиблась, фраза уходит в llm (decide это проверяет).
+RULES (applied identically by the data generator and tests)
+  1. Commands, politeness, addressing the assistant ("джарвис", "пожалуйста", "ну", "плиз") - O.
+  2. A preposition before the site/app ("на", "в", "через") and generic nouns ("сайт", "официальный сайт",
+     "главный сайт", "страница", "приложение", "программа", "папка", "файл", "документ") - O.
+     Exception: a preposition that is part of the name itself is SITE ("на урок").
+  3. A multi-word site or app name (1, 2, or 3+ words) - all words are SITE ("яндекс карты", "саунд клауд",
+     "пенсионный фонд украины", "диспетчер задач"). The name is written as spoken.
+  4. "Погугли / загугли / нагугли / поищи в гугле / найди в Google / найди на сайте гугл / поищи в интернете X" -
+     browser without a site (site=''): "в гугле", "в Google", "на сайте гугл", "в интернете", "в сети" - O.
+     "Открой гугл" (or "открой гугл и найди X") opens the site explicitly: "гугл" is SITE.
+  5. QUERY is one continuous piece: everything that describes the search object or inner app action, including inner
+     prepositions ("чехол для телефона", "термос на литр", "видео о создании AI-агента на Python") and adverbs ("быстро").
+     Search/play verbs ("найди", "поищи", "включи", "поставь") are O, while inner app action verbs ("отсортируй по дате")
+     and system commands in `system` are part of QUERY.
+  6. "Включи / поставь X" (music, artist, film) without a named platform - QUERY (browser without a site).
+     "Открой / запусти / зайди на X" - X is SITE (browser for websites, app for desktop/hybrid apps and folders).
+  7. A site name inside the question itself ("найди как отключить рекламу в ютубе", "найди отзывы
+     о ютуб премиум") is part of QUERY, not SITE.
+  8. Complex questions and requests without a browser command ("кто такой павел первый", "что такое гитхаб",
+     "в чём разница между list и tuple в питоне", "скажи погоду на завтра в 12") - llm.
+     Light factual lookups ("скажи погоду", "скажи погоду на завтра", "глянь ка сколько будет 50 евро в рубли",
+     "посмотри авиа билеты москва софия", "узнай курс доллара") - browser with site='' and query.
+  9. translate: TEXT is everything that must be translated, verbatim (including leading "это", "а", "как сказать").
+     Command wrappers ("переведи", "переведи:", "переведи как будет", "как будет", "слово", "фразу", "на английский",
+     "с русского", "по-английски") - O.
+ 10. If the model is unsure (low probability or ragged tagging) - llm (fallback=True).
+ 11. WHERE TO SEARCH. General "найди / поищи X" without a place to search and outside light search categories
+     (weather, currency, tickets/schedules) - llm.
+ 12. Home and appliances (light, curtains, alarm, timer, reminder, call, SMS, TV, climate, kitchen appliances) - llm.
+     Desktop/hybrid apps and folders go to `app`; OS power/window/file-management commands go to `system`.
+ 13. "Пожалуйста" / "плиз" in translation: right after the command or before it - O; after or inside the text - TEXT.
+ 14. "Что значит / что означает X": without a language - llm; with a language - translate.
+     "Как переводится X" is always translate (with lang='none' if no target language is named).
+ 15. Action verbs between a web site and the query ("на вольфрам альфа реши интеграл", "в спидтесте проверь пинг") - O.
+     If the tagging is ragged (SITE has any non-SITE gap, or QUERY/TEXT is torn apart by another slot) -> llm.
+ 16. Explicit naming wrappers ("проект с названием X", "сериал под названием X", "официальный / главный сайт X") - O;
+     content descriptions ("фильм Интерстеллар", "информацию о Николе Тесле", "видео о собаках") stay inside QUERY.
+ 17. Размытая цель без конкретного запроса ("давай зайдём на гитхаб, мне нужно посмотреть один репозиторий",
+     "хочу глянуть кое-что") - llm: объекта поиска нет, решает большая LLM.
+     "Мне нужен сайт X, открой его": местоимение "его/её" - O, query пустой.
 """
+import os
 import re
 from pathlib import Path
 
-import ml_home
-
-INTENTS = ("browser", "translate", "llm")
+INTENTS = ("browser", "app", "system", "translate", "llm")
 TAGS = ("O", "SITE", "QUERY", "TEXT")
 LANGS = ("none", "en", "ru", "de", "fr", "es", "it", "pt", "pl", "bg", "tr", "uk", "cs", "nl",
          "sv", "el", "ro", "sr", "zh", "ja", "ko", "ar", "hi", "fi", "da", "hu", "he", "vi", "id", "kk")
 
-BASE_MODEL = "cointegrated/rubert-tiny2"
-MODEL_DIR = str(Path(__file__).resolve().parent / "ml_model")   # абсолютный путь: не зависит от папки запуска
+# Base encoder presets (all compatible with PreTrainedTokenizerFast.word_ids() and AutoModel):
+# - "tiny"  : cointegrated/rubert-tiny2 (~29M params, 3 layers, 312d, ~3-4 ms on Ryzen 7 7840HS)
+# - "small" : intfloat/multilingual-e5-small (~118M params, 12 layers, 384d, ~9-12 ms, strong EN+RU brand/game awareness)
+# - "base"  : deepvk/USER-base (~110M params, 12 layers, 768d, ~14-18 ms, high capacity for complex Russian syntax)
+MODEL_PRESETS = {
+    "tiny": "cointegrated/rubert-tiny2",
+    "small": "intfloat/multilingual-e5-small",
+    "base": "deepvk/USER-base",
+}
+BASE_MODEL = MODEL_PRESETS["small"]
+MODEL_DIR = str(Path(__file__).resolve().parent / "ml_model")   # absolute path: independent of the working directory
 MAX_LEN = 64
-EDGE = " ,.;:!?«»\"'"
+EDGE = " ,.;:!?«»\"'“”„"
+_QUOTES = str.maketrans("", "", "«»\"“”„")
 
 
 def norm(text: str) -> str:
-    """Мягкая нормализация для сравнения: регистр, ё/е, пробелы, знаки по краям."""
-    return " ".join(text.casefold().replace("ё", "е").split()).strip(EDGE)
+    """Soft normalization for comparison: case, ё/е, quotes, spaces, punctuation at the edges."""
+    cleaned = text.translate(_QUOTES).casefold().replace("ё", "е")
+    return " ".join(cleaned.split()).strip(EDGE)
 
 
 def _span(tags, label):
-    """Индексы слов с меткой label; дыры из O между первым и последним заполняются
-    (запрос и название сайта — непрерывные куски). Если в дыре другая метка — не заполняем."""
+    """Indices of words tagged `label`; gaps of O between the first and the last one are filled for QUERY/TEXT
+    (for SITE, only contiguous SITE tokens are valid). If the gap contains another label, it is not filled."""
     idx = [i for i, t in enumerate(tags) if t == label]
     if not idx:
         return []
     first, last = idx[0], idx[-1]
+    if label == "SITE":
+        if any(t != "SITE" for t in tags[first:last + 1]):
+            return idx
+        return list(range(first, last + 1))
     if any(t not in (label, "O") for t in tags[first:last + 1]):
         return idx
     return list(range(first, last + 1))
 
 
 def assemble(words, tags) -> dict:
-    """Метки слов -> {"site", "query", "text"}. Текст берётся только из слов фразы."""
+    """Word tags -> {"site", "query", "text"}. Text is taken only from the words of the phrase.
+    Surrounding or paired guillemets/quotes («Интерстеллар», "Stable Diffusion") are stripped cleanly."""
     def build(label):
-        return " ".join(words[i] for i in _span(tags, label)).strip(EDGE)
+        raw = " ".join(words[i] for i in _span(tags, label)).strip(EDGE)
+        if label in ("SITE", "QUERY"):
+            raw = raw.translate(_QUOTES).strip(EDGE)
+        return raw
 
     return {"site": build("SITE"), "query": build("QUERY"), "text": build("TEXT")}
 
 
-THRESHOLD_INTENT = 0.90     # ниже — не уверены в намерении -> llm   (подобрано test_ml.py --sweep на финальной модели)
-THRESHOLD_SLOT = 0.75       # ниже у любого слова -> не уверены в разметке -> llm
-THRESHOLD_LANG = 0.50       # язык перевода ниже порога -> "none"
+THRESHOLD_INTENT = 0.80     # calibrated for 5 intents; tuneable via `python3 test_ml.py --sweep`
+THRESHOLD_SLOT = 0.60       # below this for any word -> unsure about the tagging -> llm
+THRESHOLD_LANG = 0.50       # target language below the threshold -> "none"
 
 
 def fragmented(tags) -> str:
-    """Рваная разметка: между первым и последним словом SITE / QUERY / TEXT стоит слово ДРУГОЙ метки.
-    Возвращает название метки или ''. Такого в обучающих данных не бывает, значит это ошибка модели."""
+    """Ragged tagging:
+    - For SITE: any non-SITE word (including O) between the first and last SITE word means a torn site span.
+    - For QUERY / TEXT: a word of ANOTHER slot label between the first and last word means ragged tagging.
+    Returns the label name or ''."""
     for label in ("SITE", "QUERY", "TEXT"):
         idx = [i for i, t in enumerate(tags) if t == label]
-        if idx and any(t not in (label, "O") for t in tags[idx[0]:idx[-1] + 1]):
+        if not idx:
+            continue
+        span = tags[idx[0]:idx[-1] + 1]
+        if label == "SITE":
+            if any(t != "SITE" for t in span):
+                return label
+        elif any(t not in (label, "O") for t in span):
             return label
     return ""
 
 
-# Глагол-команда внутри поискового запроса без сайта («у меня руки заняты включи чайник»): так бывает, когда модель
-# приняла команду устройству за медиа-запрос. В настоящем запросе таких слов почти не бывает -> лучше спросить большую LLM.
-_COMMAND_IN_QUERY = re.compile(r"(?<!\w)(включи|выключи|включай|выключай|включите|выключите|запусти|запускай|открой|открывай|закрой)(?!\w)", re.I)
+# Глагол-команда внутри поискового запроса без сайта ("у меня руки заняты включи чайник"): модель приняла команду устройству
+# за медиа-запрос. Настоящие запросы почти никогда не содержат таких слов -> лучше спросить большую LLM.
+_COMMAND_IN_QUERY = re.compile(
+    r"(?<!\w)(включи|выключи|включай|выключай|включите|выключите|запусти|запускай|открой|открывай|закрой)(?!\w)",
+    re.I,
+)
 
 
 def decide(phrase: str, words, pred: dict, t_intent=THRESHOLD_INTENT, t_slot=THRESHOLD_SLOT,
            t_lang=THRESHOLD_LANG) -> dict:
-    """Предсказание модели (вероятности и метки слов) -> решение, куда направить фразу.
+    """Model prediction (probabilities and word tags) -> decision where to route the phrase.
 
-    Страховка: если модель сомневается или разметка странная, фраза не исполняется наугад, а уходит
-    большой LLM (fallback=True). Чистая функция — проверяется тестами без модели.
+    Safety net: if the model is unsure or the tagging looks odd, the phrase is not executed blindly but
+    goes to the big LLM (fallback=True). A pure function - tested without the model.
+    Только структурные проверки: никаких статических списков сайтов, обёрток или бытовых приборов.
     """
     best = max(range(len(INTENTS)), key=lambda k: pred["intent_p"][k])
     intent, conf = INTENTS[best], pred["intent_p"][best]
     lbest = max(range(len(LANGS)), key=lambda k: pred["lang_p"][k])
     lang = LANGS[lbest] if pred["lang_p"][lbest] >= t_lang else "none"
-    parts = assemble(words, pred["tags"])
+    tags = list(pred["tags"])
+    parts = assemble(words, tags)
+
     result = {"route": intent, "site": parts["site"], "query": parts["query"], "text": parts["text"],
               "lang": lang if intent == "translate" else "none", "confidence": conf,
               "fallback": False, "reason": "", "phrase": phrase}
-    if intent == "browser":
+    if intent in ("browser", "app"):
         result["text"] = ""
+    elif intent == "system":
+        result["site"] = result["text"] = ""
     elif intent == "translate":
         result["site"] = result["query"] = ""
     else:
         result["site"] = result["query"] = result["text"] = ""
-    if intent == "llm":
+        if conf < t_intent:
+            result.update(fallback=True, reason=f"not sure about the intent ({conf:.2f})")
         return result
+
     reason = ""
     if pred.get("truncated"):
-        reason = "слишком длинная фраза"
+        reason = "phrase is too long"
     elif conf < t_intent:
-        reason = f"не уверена в намерении ({conf:.2f})"
+        reason = f"not sure about the intent ({conf:.2f})"
     elif min(pred["tag_p"]) < t_slot:
-        reason = f"не уверена в разметке слов ({min(pred['tag_p']):.2f})"
-    elif intent != "llm" and fragmented(pred["tags"]):
-        reason = f"разметка рваная ({fragmented(pred['tags'])})"
+        reason = f"not sure about the word tagging ({min(pred['tag_p']):.2f})"
+    elif fragmented(tags):
+        reason = f"ragged tagging ({fragmented(tags)})"
     elif intent == "browser" and not (result["site"] or result["query"]):
-        reason = "команда есть, а сайта и запроса не нашлось"
-    elif (intent == "browser" and not result["site"] and result["query"]
-          and not (ml_home.has_where(phrase) or ml_home.is_play(phrase))):
-        reason = "поиск без указания, где искать (правило 11)"
+        reason = "there is a command, but no site or query was found"
+    elif intent == "browser" and not result["site"] and "O" not in tags:
+        reason = "siteless query without a search or play command verb"
     elif intent == "browser" and not result["site"] and _COMMAND_IN_QUERY.search(result["query"]):
-        reason = "в запросе осталась команда (включи/открой…): похоже на команду устройству"
+        reason = "a command (включи/открой...) is left inside the query: looks like a device command"
+    elif intent == "app" and not result["site"]:
+        reason = "there is an app command, but no app or folder was found"
+    elif intent == "system" and not result["query"]:
+        reason = "there is a system command, but no action was found"
     elif intent == "translate" and not result["text"]:
-        reason = "перевод есть, а текста не нашлось"
+        reason = "there is a translation request, but no text was found"
     if reason:
         result.update(route="llm", site="", query="", text="", lang="none", fallback=True, reason=reason)
     return result
 
 
 def _wkey(word: str) -> str:
-    return word.casefold().replace("ё", "е").strip(EDGE)
+    return word.translate(_QUOTES).casefold().replace("ё", "е").strip(EDGE)
 
 
 def find_words(words, chunk: str, used=()) -> list:
-    """Индексы подряд идущих слов фразы, равных chunk (регистр, ё/е и знаки по краям не важны)."""
-    target = [_wkey(w) for w in chunk.split()]
+    """Indices of consecutive words of the phrase equal to `chunk` (case, ё/е and edge punctuation do not matter)."""
+    target = [_wkey(w) for w in chunk.split() if _wkey(w)]
     if not target:
         return []
     keys = [_wkey(w) for w in words]
@@ -186,11 +230,11 @@ def find_words(words, chunk: str, used=()) -> list:
         span = list(range(start, start + len(target)))
         if keys[start:start + len(target)] == target and not any(i in used for i in span):
             return span
-    raise ValueError(f"в фразе {' '.join(words)!r} нет подряд слов {chunk!r}")
+    raise ValueError(f"the phrase {' '.join(words)!r} has no consecutive words {chunk!r}")
 
 
 def tag_phrase(phrase: str, site: str = "", query: str = "", text: str = ""):
-    """Фраза + её куски -> (слова, метки). Нужна, чтобы ваши реальные фразы превратить в обучающие."""
+    """Phrase + its pieces -> (words, tags). Needed to turn your real phrases into training examples."""
     words = phrase.split()
     tags = ["O"] * len(words)
     used = set()
@@ -202,8 +246,7 @@ def tag_phrase(phrase: str, site: str = "", query: str = "", text: str = ""):
 
 
 def read_tsv(path):
-    """ml_real.tsv / ml_mine.tsv -> [(фраза, намерение, site, query, text, язык)]. Строки с # пропускаются."""
-    import os
+    """ml_real.tsv / ml_mine.tsv -> [(phrase, intent, site, query, text, language)]. Lines starting with # are skipped."""
     if not os.path.exists(path):
         return []
     rows = []

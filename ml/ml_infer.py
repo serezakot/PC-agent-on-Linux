@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Первый слой в работе: фраза -> куда направить и с какими данными. ~10–30 мс на CPU.
+"""First layer in production: phrase -> where to route it and with what data. ~3-15 ms on CPU.
 
-    python3 ml_infer.py                    # диалог
+    python3 ml_infer.py                    # interactive prompt
     python3 ml_infer.py "открой ютуб и найди как приготовить пирог"
 
-В коде:
+In code:
     result = await ml_infer.parse("переведи мне на английский как дела")
-    result["route"]   # "browser" | "translate" | "llm"
-    # browser:   result["site"], result["query"]   (нет site -> поиск в Google, нет query -> открыть сайт)
-    # translate: result["text"], result["lang"]    ("none" — язык не назван)
-    # llm:       фраза уходит большой LLM целиком (result["fallback"] == True, если модель сомневалась)
+    result["route"]   # "browser" | "app" | "system" | "translate" | "llm"
+    # browser:   result["site"], result["query"]   (no site -> Google/web search, no query -> just open the site)
+    # app:       result["site"], result["query"]   (desktop/hybrid app or local folder/file + optional inner query)
+    # system:    result["query"]                   (PC/OS command span)
+    # translate: result["text"], result["lang"]    ("none" - no target language was named)
+    # llm:       the whole phrase goes to the big LLM (result["fallback"] == True if the model was unsure)
 
-Журнал команд (по желанию): export ML_PARSE_LOG=1 — каждая фраза и решение модели пишутся в parse_log.jsonl,
-потом python3 ml_log.py покажет сомнительные: исправьте их и добавьте в ml_real.tsv.
-
-Страховка от ошибок: если модель не уверена (вероятность ниже порога) или разметка странная, фраза не
-исполняется «наугад», а уходит большой LLM. Ошибка превращается в медленный, но верный ответ.
+Command log (ON by default): every phrase handled via `parse()` or interactive CLI is saved to `parse_log.jsonl`
+(disable with `export ML_PARSE_LOG=0`). Run `python3 ml_log.py` or `python3 ml_log.py --stats` to review.
 """
 import asyncio
+import os
 import sys
 import time
 
@@ -31,16 +31,16 @@ _engine = None
 
 
 class Engine:
-    def __init__(self, model_dir: str = MODEL_DIR, threads: int = 4):
-        torch.set_num_threads(threads)
+    def __init__(self, model_dir: str = MODEL_DIR, threads: int = 0):
+        torch.set_num_threads(threads or os.cpu_count() or 8)
         self.model, self.tok = ml_model.load(model_dir)
-        self.predict_one("открой ютуб")                      # прогрев
+        self.predict_one("открой ютуб")                      # warm-up
 
     def predict_one(self, text: str) -> dict:
         words = text.split()
         if not words:
             return {"route": "llm", "site": "", "query": "", "text": "", "lang": "none", "confidence": 0.0,
-                    "fallback": True, "reason": "пустая фраза", "phrase": text}
+                    "fallback": True, "reason": "empty phrase", "phrase": text}
         pred = ml_model.predict(self.model, self.tok, [words])[0]
         return decide(text, words, pred)
 
@@ -55,17 +55,19 @@ def get_engine(model_dir: str = MODEL_DIR) -> Engine:
 async def parse(text: str, model_dir: str = MODEL_DIR) -> dict:
     engine = await asyncio.to_thread(get_engine, model_dir)
     result = await asyncio.to_thread(engine.predict_one, text)
-    ml_log.log_result(result)                # только если включено: export ML_PARSE_LOG=1 (см. ml_log.py)
+    ml_log.log_result(result)
     return result
 
 
 def show(result: dict, seconds: float) -> None:
     print(f"  route : {result['route']}" + (f"   (-> LLM: {result['reason']})" if result["fallback"] else ""))
-    if result["route"] == "browser":
+    if result["route"] in ("browser", "app"):
         print(f"  site  : {result['site']!r}\n  query : {result['query']!r}")
+    elif result["route"] == "system":
+        print(f"  query : {result['query']!r}")
     elif result["route"] == "translate":
         print(f"  text  : {result['text']!r}\n  lang  : {result['lang']}")
-    print(f"  уверенность {result['confidence']:.2f}, {seconds * 1000:.0f} мс")
+    print(f"  confidence {result['confidence']:.2f}, {seconds * 1000:.0f} ms")
 
 
 def main(argv) -> int:
@@ -77,12 +79,24 @@ def main(argv) -> int:
         import readline  # noqa: F401
     except ImportError:
         pass
-    engine = Engine()
-    if argv:
+    model_dir = MODEL_DIR
+    rest = list(argv)
+    if "--model" in rest:
+        idx = rest.index("--model")
+        if idx + 1 < len(rest):
+            model_dir = rest[idx + 1]
+            del rest[idx:idx + 2]
+    engine = Engine(model_dir=model_dir)
+    arch = getattr(engine.model.enc.config, "_name_or_path", model_dir)
+    if rest:
+        phrase = " ".join(rest)
         t = time.perf_counter()
-        show(engine.predict_one(" ".join(argv)), time.perf_counter() - t)
+        res = engine.predict_one(phrase)
+        dt = time.perf_counter() - t
+        ml_log.log_result(res)
+        show(res, dt)
         return 0
-    print("Вписывайте фразу; «выход» — закончить.")
+    print(f'Loaded model from "{model_dir}" ({arch}). Type a phrase; "exit" to quit.')
     while True:
         try:
             line = input("ml> ").strip()
@@ -93,7 +107,10 @@ def main(argv) -> int:
             return 0
         if line:
             t = time.perf_counter()
-            show(engine.predict_one(line), time.perf_counter() - t)
+            res = engine.predict_one(line)
+            dt = time.perf_counter() - t
+            ml_log.log_result(res)
+            show(res, dt)
 
 
 if __name__ == "__main__":
