@@ -64,7 +64,7 @@ def show(result: dict, seconds: float) -> None:
     if result["route"] in ("browser", "app"):
         print(f"  site  : {result['site']!r}\n  query : {result['query']!r}")
     elif result["route"] == "system":
-        print(f"  query : {result['query']!r}")
+        print(f"  action: {result.get('action')}\n  query : {result['query']!r}\n  site  : {result['site']!r}" + (f"\n  text  : {result['text']!r}" if result.get("text") else ""))
     elif result["route"] == "translate":
         print(f"  text  : {result['text']!r}\n  lang  : {result['lang']}")
     print(f"  confidence {result['confidence']:.2f}, {seconds * 1000:.0f} ms")

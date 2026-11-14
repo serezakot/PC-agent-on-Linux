@@ -674,6 +674,65 @@ def _is_google_root(url: str) -> bool:
     return bool(re.fullmatch(r"(www\.)?google\.[a-z.]+", host)) and parts.path in ("", "/", "/webhp")
 
 
+_YT_SITE_NAMES = {
+    "youtube", "youtube.com", "youtu.be", "yt",
+    "ютуб", "ютубе", "ютуба", "ютубу", "ютубом",
+    "ютюб", "ютюбе", "ютюба", "ютюбу",
+    "ютубчик", "ютубчике",
+}
+_YT_VIDEO_RENDERER_RE = re.compile(r'"videoRenderer"\s*:\s*\{\s*"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"')
+_YT_VIDEO_FALLBACK_RE = re.compile(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"')
+_YT_CHANNEL_CANONICAL_RE = re.compile(r'"canonicalBaseUrl"\s*:\s*"(/(?:@[^"\\]+|channel/[^"\\]+|c/[^"\\]+|user/[^"\\]+))"')
+_YT_CHANNEL_HANDLE_RE = re.compile(r'"url"\s*:\s*"(/@[^"\\]+)"')
+
+
+def _is_youtube_site(site: str, host: str = "") -> bool:
+    """Проверяет, относится ли название сайта или домен к YouTube."""
+    s = normalize_query(site or "").lower().strip(" ,.;:!?«»\"'")
+    h = (host or "").lower()
+    return s in _YT_SITE_NAMES or h in ("youtube.com", "youtu.be", "m.youtube.com")
+
+
+def resolve_youtube_video(query: str, fetch=None) -> str | None:
+    """Находит первое реальное видео в выдаче YouTube по запросу и возвращает прямую ссылку watch?v=..."""
+    q = normalize_query(query or "")
+    if not q:
+        return None
+    fetch = fetch or _fetch_page
+    search_page_url = "https://www.youtube.com/results?" + urlencode({"search_query": q})
+    page = fetch(search_page_url)
+    if not page:
+        return None
+    _final_url, html = page
+    m = _YT_VIDEO_RENDERER_RE.search(html) or _YT_VIDEO_FALLBACK_RE.search(html)
+    if not m:
+        return None
+    return f"https://www.youtube.com/watch?v={m.group(1)}"
+
+
+def resolve_youtube_channel(query: str, fetch=None) -> str | None:
+    """Находит страницу канала на YouTube по названию/нику и возвращает прямую ссылку на канал."""
+    q = normalize_query(query or "")
+    if not q:
+        return None
+    fetch = fetch or _fetch_page
+    # sp=EgIQAg%3D%3D включает фильтр «Только каналы» в поиске YouTube
+    search_page_url = f"https://www.youtube.com/results?search_query={quote_plus(q)}&sp=EgIQAg%3D%3D"
+    page = fetch(search_page_url)
+    if not page:
+        return None
+    _final_url, html = page
+    # Ищем сначала внутри блока channelRenderer, чтобы не захватить случайный канал из меню
+    idx = html.find('"channelRenderer"')
+    sub = html[idx:idx + 15000] if idx != -1 else html
+    m = _YT_CHANNEL_CANONICAL_RE.search(sub) or _YT_CHANNEL_HANDLE_RE.search(sub)
+    if not m and idx != -1:
+        m = _YT_CHANNEL_CANONICAL_RE.search(html) or _YT_CHANNEL_HANDLE_RE.search(html)
+    if not m:
+        return None
+    return f"https://www.youtube.com{m.group(1)}"
+
+
 def make_translate_plan(text: str, lang: str = "none") -> Plan | None:
     """Google Переводчик для (текст, язык перевода). None — переводить нечего."""
     text = normalize_query(text or "")
@@ -682,15 +741,45 @@ def make_translate_plan(text: str, lang: str = "none") -> Plan | None:
     return Plan("translate", translate_url(text, lang), term=text, source=target_language(text, lang))
 
 
-def make_plan(site: str, query: str = "", resolver=None, finder=None) -> Plan | None:
+def make_plan(
+    site: str,
+    query: str = "",
+    resolver=None,
+    finder=None,
+    action: str = "web_search",
+    page_fetcher=None,
+) -> Plan | None:
     """Решает, какой адрес открыть. None — искать нечего (и сайт, и запрос пустые).
 
-    site и query приходят от модели. resolver(lucky_url) -> адрес сайта или None (по умолчанию resolve_target);
-    finder(page_url) -> (шаблон, способ) или None (по умолчанию find_search_template).
+    site, query и action приходят от модели:
+      • action == "web_open_first" — открыть сразу первое видео на YouTube (или первый результат)
+      • action == "web_channel"    — открыть страницу канала на YouTube
+      • action == "web_search"     — поиск на сайте или в Google
+      • action == "web_open"       — открыть сам сайт
     """
+    custom_resolver = resolver is not None
     resolver = resolver or resolve_target
     finder = finder or find_search_template
     site, query = normalize_query(site or ""), normalize_query(query or "")
+
+    # Прямое открытие канала (в т.ч. когда сайт не назван: «открой канал fireship» или назван YouTube)
+    if action == "web_channel" and query and (not site or _is_youtube_site(site)):
+        yt_fetcher = page_fetcher or ((lambda _u: None) if custom_resolver else _fetch_page)
+        ch_url = resolve_youtube_channel(query, fetch=yt_fetcher)
+        if ch_url:
+            return Plan("youtube_channel", ch_url, "youtube.com", query, "youtube_channel")
+        fallback_ch = f"https://www.youtube.com/results?search_query={quote_plus(query)}&sp=EgIQAg%3D%3D"
+        return Plan("youtube_channel", fallback_ch, "youtube.com", query, "youtube_channel_search")
+
+    # Прямое открытие первого видео на YouTube («открой в ютубе пайтон за час», «включи в ютубе влада а4»)
+    if action == "web_open_first" and query and _is_youtube_site(site):
+        yt_fetcher = page_fetcher or ((lambda _u: None) if custom_resolver else _fetch_page)
+        vid_url = resolve_youtube_video(query, fetch=yt_fetcher)
+        if vid_url:
+            return Plan("youtube_video", vid_url, "youtube.com", query, "youtube_first_video")
+        fallback_vid = "https://www.youtube.com/results?" + urlencode({"search_query": query})
+        return Plan("youtube_video", fallback_vid, "youtube.com", query, "youtube_search_fallback")
+
     if not site:                          # сайт не назван — настоящий поиск в Google (страница результатов)
         return Plan("google_search", search_url(query), term=query) if query else None
 
@@ -703,6 +792,18 @@ def make_plan(site: str, query: str = "", resolver=None, finder=None) -> Plan | 
         return Plan("site_home", home, host)
     if _is_google_root(home):             # «открой гугл и найди X» — это обычный поиск Google
         return Plan("google_search", search_url(query), host, query)
+
+    # Если домен после резолва оказался YouTube и модель указала web_open_first / web_channel
+    if _is_youtube_site(site, host) and action in ("web_open_first", "web_channel"):
+        yt_fetcher = page_fetcher or ((lambda _u: None) if custom_resolver else _fetch_page)
+        if action == "web_channel":
+            ch_url = resolve_youtube_channel(query, fetch=yt_fetcher)
+            if ch_url:
+                return Plan("youtube_channel", ch_url, host, query, "youtube_channel")
+        else:
+            vid_url = resolve_youtube_video(query, fetch=yt_fetcher)
+            if vid_url:
+                return Plan("youtube_video", vid_url, host, query, "youtube_first_video")
 
     found = finder(home)                  # 2. как искать на этом сайте — узнаём у самого сайта
     if found:
@@ -774,6 +875,10 @@ _SOURCE_NAMES = {"opensearch": "OpenSearch", "jsonld": "SearchAction", "form": "
 
 
 def _describe(plan: Plan) -> str:
+    if plan.kind == "youtube_video":
+        return f"YouTube: открываю первое видео по запросу «{plan.term}»: {plan.url}"
+    if plan.kind == "youtube_channel":
+        return f"YouTube: открываю страницу канала «{plan.term}»: {plan.url}"
     if plan.kind == "google_search":
         return f"Ищу в Google «{plan.term}»: {plan.url}"
     if plan.kind == "translate":
@@ -829,14 +934,15 @@ def model_parse(phrase: str) -> dict:
 def handle_phrase(phrase: str, parser=model_parse, opener=open_in_browser, resolver=None, finder=None):
     """Одна фраза от начала до конца. Возвращает (решение модели, план или None).
 
-    browser   -> поиск в Google / сайт / поиск на сайте;
+    browser   -> поиск в Google / сайт / поиск на сайте / первое видео или канал на YouTube;
     translate -> Google Переводчик с подставленными текстом и языком;
-    остальное -> браузер не открывается (эта ветка ещё не подключена), план None.
+    остальное -> браузер не открывается, план None.
     """
     result = parser(phrase)
     route = result.get("route")
     if route == "browser":
-        plan = make_plan(result.get("site", ""), result.get("query", ""), resolver, finder)
+        action = result.get("action") or "web_search"
+        plan = make_plan(result.get("site", ""), result.get("query", ""), resolver, finder, action=action)
     elif route == "translate":
         plan = make_translate_plan(result.get("text", ""), result.get("lang", "none"))
     else:
@@ -846,15 +952,21 @@ def handle_phrase(phrase: str, parser=model_parse, opener=open_in_browser, resol
     return result, plan
 
 
-def _show_model(result: dict) -> str:
+def describe_decision(result: dict) -> str:
+    """Одна строка о решении модели для терминала (используется и assistant.py)."""
     route = result.get("route")
-    extra = {"browser": f"сайт={result.get('site') or '—'}, запрос={result.get('query') or '—'}",
-             "translate": f"текст={result.get('text')!r}, язык={result.get('lang')}",
-             "llm": "отправляю большой LLM (пока не подключена)"}.get(
-                 route, "отправляю большой LLM (пока не подключена)"
-             )
+    act = result.get("action") or ""
+    act_str = f" [{act}]" if act and act != "none" else ""
+    extra = {
+        "browser": f"сайт={result.get('site') or '—'}, запрос={result.get('query') or '—'}",
+        "translate": f"текст={result.get('text')!r}, язык={result.get('lang')}",
+        "app": f"приложение/папка={result.get('site') or '—'}, действие={result.get('query') or '—'}",
+        "system": f"цель={result.get('query') or '—'}, место={result.get('site') or '—'}"
+                  + (f", текст={result.get('text')!r}" if result.get("text") else ""),
+        "llm": "отправляю большой LLM (пока не подключена)",
+    }.get(route, "отправляю большой LLM (пока не подключена)")
     note = f"  [страховка: {result['reason']}]" if result.get("fallback") else ""
-    return f"модель: {route} · {extra}{note}"
+    return f"модель: {route}{act_str} · {extra}{note}"
 
 
 def _run(phrase: str, opener, dry_run: bool) -> bool:
@@ -870,11 +982,15 @@ def _run(phrase: str, opener, dry_run: bool) -> bool:
     except BrowserError as exc:
         print(f"Ошибка: не удалось открыть браузер — {exc}")
         return False
-    print(_show_model(result))
+    print(describe_decision(result))
+    route = result.get("route")
+    if route in ("app", "system"):
+        print("Это команда для программ или системы: запустите assistant.py (этот модуль отвечает только за браузер).")
+        return True
     if plan is None:
-        if result.get("route") == "browser":
+        if route == "browser":
             print("Искать нечего.")
-        elif result.get("route") == "translate":
+        elif route == "translate":
             print("Переводить нечего.")
         return True
     print(plan.url if dry_run else _describe(plan))

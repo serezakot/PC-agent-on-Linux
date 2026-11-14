@@ -17,3 +17,9 @@ ml/ml_model_v1/
 parse_log.jsonl
 ml/parse_log.jsonl
 ml/ml_review.tsv
+
+# журналы обучения
+ml/train*.log
+
+# настройки PyCharm (пересоздаются сами)
+.idea/

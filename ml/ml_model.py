@@ -1,4 +1,4 @@
-"""First-layer model: rubert-tiny2 + three heads (intent, translation language, per-word tag)."""
+"""First-layer model: encoder + four heads (intent, canonical action, translation language, per-word tag)."""
 import os
 from pathlib import Path
 
@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
-from ml_spec import INTENTS, LANGS, MAX_LEN, TAGS, _QUOTES
+from ml_spec import ACTIONS, INTENTS, LANGS, MAX_LEN, TAGS, _QUOTES
 
 
 class Parser(nn.Module):
@@ -16,13 +16,15 @@ class Parser(nn.Module):
         hidden = self.enc.config.hidden_size
         self.drop = nn.Dropout(0.1)
         self.intent = nn.Linear(hidden, len(INTENTS))
+        self.action = nn.Linear(hidden, len(ACTIONS))
         self.lang = nn.Linear(hidden, len(LANGS))
         self.tag = nn.Linear(hidden, len(TAGS))
 
     def forward(self, input_ids, attention_mask):
         hidden = self.enc(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         hidden = self.drop(hidden)
-        return self.intent(hidden[:, 0]), self.lang(hidden[:, 0]), self.tag(hidden)
+        cls_h = hidden[:, 0]
+        return self.intent(cls_h), self.action(cls_h), self.lang(cls_h), self.tag(hidden)
 
 
 def tokenize(tok, batch_words):
@@ -58,6 +60,13 @@ def load(path):
     tok = AutoTokenizer.from_pretrained(path)
     model = Parser(str(path))
     heads = torch.load(path / "heads.pt", map_location="cpu")
+    if "action.weight" in heads and heads["action.weight"].shape != model.action.weight.shape:
+        old_w, old_b = heads.pop("action.weight"), heads.pop("action.bias", None)
+        n_copy = min(old_w.shape[0], model.action.weight.shape[0])
+        with torch.no_grad():
+            model.action.weight[:n_copy].copy_(old_w[:n_copy])
+            if old_b is not None:
+                model.action.bias[:n_copy].copy_(old_b[:n_copy])
     result = model.load_state_dict(heads, strict=False)
     if result.unexpected_keys:
         raise RuntimeError(f"unexpected keys in heads.pt: {result.unexpected_keys}")
@@ -67,10 +76,10 @@ def load(path):
 
 @torch.inference_mode()
 def predict(model: Parser, tok, batch_words):
-    """For every phrase: intent and language probabilities, plus the tag of each word and its probability."""
+    """For every phrase: intent, action, and language probabilities, plus the tag of each word and its probability."""
     enc = tokenize(tok, batch_words)
-    il, ll, tl = model(enc["input_ids"], enc["attention_mask"])
-    ip, lp, tp = il.softmax(-1), ll.softmax(-1), tl.softmax(-1)
+    il, al, ll, tl = model(enc["input_ids"], enc["attention_mask"])
+    ip, ap, lp, tp = il.softmax(-1), al.softmax(-1), ll.softmax(-1), tl.softmax(-1)
     out = []
     for i, words in enumerate(batch_words):
         first = first_tokens(enc, i)
@@ -84,6 +93,12 @@ def predict(model: Parser, tok, batch_words):
             else:                      # the word did not fit into MAX_LEN
                 tags.append("O")
                 tag_p.append(0.0)
-        out.append({"intent_p": ip[i].tolist(), "lang_p": lp[i].tolist(), "tags": tags, "tag_p": tag_p,
-                    "truncated": len(first) < len(words)})
+        out.append({
+            "intent_p": ip[i].tolist(),
+            "action_p": ap[i].tolist(),
+            "lang_p": lp[i].tolist(),
+            "tags": tags,
+            "tag_p": tag_p,
+            "truncated": len(first) < len(words),
+        })
     return out

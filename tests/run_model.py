@@ -7,6 +7,8 @@
     python3 tests/run_model.py --route browser --no-reach
     python3 tests/run_model.py --tsv ошибки.tsv     # ошибки в формате ml_real.tsv: ПРАВИЛЬНЫЙ разбор, готово для дообучения
     python3 tests/run_model.py --selftest           # проверить сам отчёт на «подпорченном» парсере (без модели)
+    python3 tests/run_model.py --set system         # только системные команды и программы (tests/cases_system.py)
+    python3 tests/run_model.py --set browser        # только браузер / переводчик / llm
 
 Как читать итог. У фразы пять возможных исходов:
     ok            — всё верно
@@ -29,6 +31,7 @@ for p in (ROOT / "ml", HERE):
     sys.path.insert(0, str(p))
 
 from cases import all_cases           # noqa: E402
+from cases_system import ALL as SYSTEM_CASES   # noqa: E402
 from ml_spec import norm              # noqa: E402
 
 
@@ -45,6 +48,10 @@ def judge(case, res):
         return ("страховка", res.get("reason", "")) if res.get("fallback") else ("ушла в llm", "")
     if got != case.route:
         return "не те данные", f"маршрут {got} вместо {case.route}: {describe(res)}"
+    if case.route in ("system", "app"):
+        ok = (res.get("action") == case.action or case.route == "app") and same(res.get("site", ""), case.site) \
+            and same(res.get("query", ""), case.query) and same(res.get("text", ""), case.text)
+        return ("ok", "") if ok else ("не те данные", describe(res))
     if case.route == "browser":
         if same(res.get("site", ""), case.site) and same(res.get("query", ""), case.query):
             return "ok", ""
@@ -54,6 +61,9 @@ def judge(case, res):
 
 
 def describe(res):
+    if res.get("route") in ("system", "app"):
+        extra = f" text={res.get('text')!r}" if res.get("text") else ""
+        return f"{res.get('route')} [{res.get('action')}] query={res.get('query')!r} site={res.get('site')!r}{extra}"
     if res.get("route") == "browser":
         return f"browser site={res.get('site')!r} query={res.get('query')!r}"
     if res.get("route") == "translate":
@@ -62,6 +72,9 @@ def describe(res):
 
 
 def expected(case):
+    if case.route in ("system", "app"):
+        extra = f" text={case.text!r}" if case.text else ""
+        return f"{case.route} [{case.action}] query={case.query!r} site={case.site!r}{extra}"
     if case.route == "browser":
         return f"browser site={case.site!r} query={case.query!r}"
     if case.route == "translate":
@@ -78,8 +91,10 @@ def selftest_parser(cases):
         c = table[phrase]
         counter["n"] += 1
         n = counter["n"]
-        res = {"route": c.route, "site": c.site, "query": c.query, "text": c.text, "lang": c.lang,
-               "confidence": 0.99, "fallback": False, "reason": "", "phrase": phrase}
+        res = {"route": c.route, "action": getattr(c, "action", ""), "site": c.site, "query": c.query, "text": c.text,
+               "lang": getattr(c, "lang", "none"), "confidence": 0.99, "fallback": False, "reason": "", "phrase": phrase}
+        if c.route in ("system", "app") and n % 9 == 0:
+            res["action"] = "vol_up" if c.action != "vol_up" else "vol_down"
         if c.route != "llm" and n % 10 == 0:
             res.update(route="llm", site="", query="", text="", lang="none", fallback=True, reason="не уверена в намерении (0.70)")
         elif c.route == "browser" and c.query and n % 17 == 0:
@@ -105,7 +120,8 @@ def load_real_parser():
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Прогон корпуса фраз через обученную модель")
     ap.add_argument("--hand", action="store_true", help="только ручные фразы")
-    ap.add_argument("--tag"), ap.add_argument("--route", choices=["browser", "translate", "llm"])
+    ap.add_argument("--tag"), ap.add_argument("--route", choices=["browser", "translate", "llm", "system", "app"])
+    ap.add_argument("--set", choices=["all", "browser", "system"], default="all", help="какой корпус прогонять")
     ap.add_argument("--no-reach", action="store_true", help="убрать «reach»-фразы вовсе")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--show", type=int, default=25, help="сколько ошибок каждого вида печатать")
@@ -115,7 +131,11 @@ def main(argv=None) -> int:
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
 
-    cases = all_cases(generated=not a.hand)
+    cases = []
+    if a.set in ("all", "browser"):
+        cases += all_cases(generated=not a.hand)
+    if a.set in ("all", "system"):
+        cases += list(SYSTEM_CASES)
     if a.tag:
         cases = [c for c in cases if c.tag == a.tag]
     if a.route:
@@ -142,7 +162,7 @@ def main(argv=None) -> int:
         elif a.show_ok:
             print(f"  ok  {c.phrase}")
 
-    counted = [c for c in cases if c.tag != "reach"]
+    counted = [c for c in cases if c.tag not in ("reach", "app_reach")]
     ok_counted = sum(1 for c in counted if not any(c is f for f in fails))
     print(f"\nФраз: {len(cases)} (в зачёт {len(counted)}). Верно в зачёте: {ok_counted} = {ok_counted / max(1, len(counted)):.1%}")
     print(f"Время на фразу: среднее {statistics.mean(times):.0f} мс, 95-й процентиль {sorted(times)[int(len(times) * 0.95) - 1]:.0f} мс")
@@ -165,9 +185,10 @@ def main(argv=None) -> int:
     if a.tsv:
         with open(a.tsv, "w", encoding="utf-8") as f:
             for c in fails:
-                if c.tag == "reach":
+                if c.tag in ("reach", "app_reach"):
                     continue
-                f.write("\t".join([c.phrase, c.route, c.site, c.query, c.text, c.lang]) + "\n")
+                f.write("\t".join([c.phrase, c.route, c.site, c.query, c.text, getattr(c, "lang", "none"),
+                                   getattr(c, "action", "")]) + "\n")
         print(f"\nОшибки в формате ml_real.tsv: {a.tsv}")
     return 0 if ok_counted / max(1, len(counted)) >= a.min_accuracy else 1
 

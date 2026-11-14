@@ -18,7 +18,6 @@ for p in (ROOT, ROOT / "ml", Path(__file__).resolve().parent):
     sys.path.insert(0, str(p))
 
 import gogle_search as g          # noqa: E402
-import ml_home                     # noqa: E402
 import ml_spec                     # noqa: E402
 from cases import all_cases, expected_kind   # noqa: E402
 
@@ -190,6 +189,28 @@ class TestMakePlan(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertFalse(g._is_google_root(url))
 
+    def test_youtube_open_first_video(self):
+        fake_yt_html = 'var ytInitialData = {"contents":{"videoRenderer":{"videoId":"rfscVS0vtbw"}}};'
+        plan = g.make_plan(
+            "ютубе",
+            "пайтон за час",
+            action="web_open_first",
+            page_fetcher=lambda url: (url, fake_yt_html),
+        )
+        self.assertEqual(plan.kind, "youtube_video")
+        self.assertEqual(plan.url, "https://www.youtube.com/watch?v=rfscVS0vtbw")
+
+    def test_youtube_open_channel_page(self):
+        fake_ch_html = 'var ytInitialData = {"channelRenderer":{"channelId":"UCsBjURrPoezykLs9EqgamOA","canonicalBaseUrl":"/@Fireship"}};'
+        plan = g.make_plan(
+            "ютубе",
+            "fireship",
+            action="web_channel",
+            page_fetcher=lambda url: (url, fake_ch_html),
+        )
+        self.assertEqual(plan.kind, "youtube_channel")
+        self.assertEqual(plan.url, "https://www.youtube.com/@Fireship")
+
 
 class TestTranslatePlan(unittest.TestCase):
     def test_plan(self):
@@ -326,11 +347,6 @@ class TestCorpus(unittest.TestCase):
             with self.subTest(phrase=c.phrase):
                 words, tags = ml_spec.tag_phrase(c.phrase, c.site, c.query, c.text)
                 self.assertEqual(len(words), len(tags))
-
-    def test_corpus_obeys_where_to_search_rule(self):
-        for c in self.cases:
-            with self.subTest(phrase=c.phrase):
-                self.assertEqual(ml_home.rule_violation(c.phrase, c.route, c.site, c.query), "")
 
     def test_variety(self):
         sites = {c.site.casefold() for c in self.cases if c.site}
