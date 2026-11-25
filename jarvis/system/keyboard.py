@@ -1,23 +1,20 @@
 """Клавиатура: раскладка, вкладки браузера, прокрутка и навигация по странице, масштаб, буфер обмена текста, undo/redo, клавиши."""
 from __future__ import annotations
 
-import datetime as dt
-import json
-import os
 import re
-import shlex
 import shutil
 import subprocess
-import sys
-import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import CLIPBOARD_STATE_FILE, KEY_A, KEY_C, KEY_END, KEY_ENTER, KEY_ESC, KEY_F5, KEY_HOME, KEY_LEFT, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_SPACE, KEY_SUPER, KEY_T, KEY_TAB, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z, SystemCommandError, SystemPlan, _norm, _register, _send_keys_or_xdotool, _wayland_send_keycodes  # noqa: F401
-from .files import _clipboard_files_get, _dest_dir_from_site, _fo_copy, _fo_move, _unique_copy_dest, _wait_exists, _wait_gone  # noqa: F401
-from .media import _h_media_next, _h_media_play_pause, _h_media_prev  # noqa: F401
-from .windows import _h_win_fullscreen  # noqa: F401
+from .core import (
+    CLIPBOARD_STATE_FILE, KEY_A, KEY_C, KEY_END, KEY_ENTER, KEY_ESC, KEY_F5, KEY_HOME, KEY_LEFT, KEY_LEFTALT,
+    KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_SPACE, KEY_SUPER, KEY_T, KEY_TAB, KEY_V,
+    KEY_W, KEY_X, KEY_Y, KEY_Z, SystemCommandError, SystemPlan, _norm, _register, _send_keys_or_xdotool,
+    _wayland_send_keycodes,
+)
+from .files import (
+    _clipboard_files_get, _dest_dir_from_site, _fo_copy, _fo_move, _unique_copy_dest, _wait_exists, _wait_gone,
+)
 
 # --- 4.8. Переключение языка / раскладки клавиатуры ---
 def _switch_layout_op(target_lang: str = "") -> str:
@@ -428,21 +425,56 @@ def _h_key_space(query: str, site: str, home: Path, dirs: dict[str, Path]) -> Sy
     )
 
 
+# Клавиши по названию: linux evdev-код и имя для xdotool. Это таблица клавиатуры (знание), а не разбор фраз.
+_FKEY_CODES = {1: 59, 2: 60, 3: 61, 4: 62, 5: 63, 6: 64, 7: 65, 8: 66, 9: 67, 10: 68, 11: 87, 12: 88}
+_NAMED_KEYS = {
+    "enter": (28, "Return"), "энтер": (28, "Return"), "ввод": (28, "Return"), "return": (28, "Return"),
+    "escape": (1, "Escape"), "esc": (1, "Escape"), "эскейп": (1, "Escape"), "искейп": (1, "Escape"),
+    "пробел": (57, "space"), "space": (57, "space"), "спейс": (57, "space"),
+    "tab": (15, "Tab"), "таб": (15, "Tab"), "табуляция": (15, "Tab"),
+    "delete": (111, "Delete"), "del": (111, "Delete"), "делит": (111, "Delete"), "делете": (111, "Delete"),
+    "backspace": (14, "BackSpace"), "бэкспейс": (14, "BackSpace"), "бекспейс": (14, "BackSpace"),
+    "home": (102, "Home"), "хоум": (102, "Home"), "end": (107, "End"), "энд": (107, "End"),
+    "pageup": (104, "Prior"), "pagedown": (109, "Next"),
+    "вверх": (103, "Up"), "up": (103, "Up"), "вниз": (108, "Down"), "down": (108, "Down"),
+    "влево": (105, "Left"), "left": (105, "Left"), "вправо": (106, "Right"), "right": (106, "Right"),
+    "insert": (110, "Insert"), "инсерт": (110, "Insert"), "printscreen": (99, "Print"), "принтскрин": (99, "Print"),
+}
+_RU_NUM = {"один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
+           "десять": 10, "одиннадцать": 11, "двенадцать": 12}
+
+
+def _parse_key(query: str) -> tuple[int, str, str] | None:
+    """«f5», «ф11», «эф пять», «F12», «таб», «стрелку вверх» -> (evdev-код, имя xdotool, подпись) или None."""
+    q = _norm(query).replace("-", " ")
+    q = re.sub(r"\b(?:клавиш[уа]|кнопк[уа]|стрелк[уа]|стрелочк[уа]|на)\b", " ", q)
+    q = " ".join(q.split())
+    m = re.fullmatch(r"(?:f|ф|эф)\s*(\d{1,2}|" + "|".join(_RU_NUM) + r")", q)
+    if m:
+        n = int(m.group(1)) if m.group(1).isdigit() else _RU_NUM[m.group(1)]
+        if n in _FKEY_CODES:
+            return _FKEY_CODES[n], f"F{n}", f"F{n}"
+        return None
+    key = q.replace(" ", "")
+    if key in _NAMED_KEYS:
+        code, xname = _NAMED_KEYS[key]
+        return code, xname, xname
+    return None
+
+
 @_register("key_func", "key_press")
 def _h_key_press(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
-    q = _norm(query)
-    if q == "f8":
-        return _h_media_play_pause(query, site, home, dirs)
-    if q == "f9":
-        return _h_media_prev(query, site, home, dirs)
-    if q == "f10":
-        return _h_media_next(query, site, home, dirs)
-    if q == "f11":
-        return _h_win_fullscreen(query, site, home, dirs)
-    if q == "f5":
-        return _h_page_refresh(query, site, home, dirs)
-    if q in ("энтер", "enter"):
-        return _h_key_enter(query, site, home, dirs)
-    if q in ("эскейп", "escape", "esc"):
-        return _h_key_escape(query, site, home, dirs)
-    return _h_key_space(query, site, home, dirs)
+    """Нажимает ИМЕННО названную клавишу (F1-F12, Enter, Tab, Delete, стрелки...). Непонятная клавиша — честная ошибка,
+    а не случайное нажатие."""
+    parsed = _parse_key(query)
+    if parsed is None:
+        def _fail() -> str:
+            raise SystemCommandError(f"не поняла, какую клавишу нажать: «{query}»")
+        return SystemPlan(category="keyboard", action="press_key", description=f"Не поняла, какую клавишу нажать («{query}»)",
+                          commands=(), python_op=_fail)
+    code, xname, label = parsed
+    return SystemPlan(
+        category="keyboard", action="press_key", description=f"Нажимаю клавишу {label}",
+        commands=(("xdotool", "key", xname),),
+        python_op=lambda: _send_keys_or_xdotool(((code,),), ("xdotool", "key", xname), f"Нажата клавиша {label}"),
+    )

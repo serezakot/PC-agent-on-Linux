@@ -1,20 +1,12 @@
 """Сеть: Wi‑Fi, Bluetooth (вкл/выкл, подключение устройств), авиарежим, хотспот, VPN, перезапуск Wi‑Fi, IP-адрес."""
 from __future__ import annotations
 
-import datetime as dt
-import json
-import os
 import re
-import shlex
-import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import SystemCommandError, SystemPlan, _norm, _register, name_similarity_safe  # noqa: F401
+from .core import SystemCommandError, SystemPlan, _norm, _register, name_similarity_safe
 
 # --- 4.4. Сеть, Bluetooth, Режим полёта (GNOME Rfkill DBus + NetworkManager) ---
 @_register("wifi_on")

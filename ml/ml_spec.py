@@ -50,7 +50,6 @@ There are no phrase rules in this module: labels come from the training data (bu
 training lab), the model predicts them, decide() only applies confidence thresholds.
 """
 import os
-import re
 from pathlib import Path
 
 INTENTS = ("browser", "app", "system", "translate", "llm")

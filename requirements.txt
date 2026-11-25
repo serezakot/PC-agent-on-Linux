@@ -1,5 +1,11 @@
-# gogle_search.py и router.py — только стандартная библиотека.
-# Парсер на модели (папка ml/):
+# Первый слой (модель в ml/):
 torch
 transformers
+# Второй слой (Gemini через Vertex AI):
+openai
+httpx
+google-auth
+# Голос: распознавание GigaAM (onnx-asr) и синтез Piper (onnxruntime ставится вместе с onnx-asr)
+onnx-asr[cpu,hub]
+# Тесты:
 pytest

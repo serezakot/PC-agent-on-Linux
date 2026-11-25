@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
 """First layer in production: phrase -> where to route it and with what data. ~3-15 ms on CPU.
-
-    python3 ml_infer.py                    # interactive prompt
-    python3 ml_infer.py "открой ютуб и найди как приготовить пирог"
 
 In code:
     result = await ml_infer.parse("переведи мне на английский как дела")
@@ -18,8 +14,6 @@ Command log (ON by default): every phrase handled via `parse()` or interactive C
 """
 import asyncio
 import os
-import sys
-import time
 
 import torch
 
@@ -57,61 +51,3 @@ async def parse(text: str, model_dir: str = MODEL_DIR) -> dict:
     result = await asyncio.to_thread(engine.predict_one, text)
     ml_log.log_result(result)
     return result
-
-
-def show(result: dict, seconds: float) -> None:
-    print(f"  route : {result['route']}" + (f"   (-> LLM: {result['reason']})" if result["fallback"] else ""))
-    if result["route"] in ("browser", "app"):
-        print(f"  site  : {result['site']!r}\n  query : {result['query']!r}")
-    elif result["route"] == "system":
-        print(f"  action: {result.get('action')}\n  query : {result['query']!r}\n  site  : {result['site']!r}" + (f"\n  text  : {result['text']!r}" if result.get("text") else ""))
-    elif result["route"] == "translate":
-        print(f"  text  : {result['text']!r}\n  lang  : {result['lang']}")
-    print(f"  confidence {result['confidence']:.2f}, {seconds * 1000:.0f} ms")
-
-
-def main(argv) -> int:
-    try:
-        sys.stdin.reconfigure(errors="replace")
-    except (AttributeError, ValueError):
-        pass
-    try:
-        import readline  # noqa: F401
-    except ImportError:
-        pass
-    model_dir = MODEL_DIR
-    rest = list(argv)
-    if "--model" in rest:
-        idx = rest.index("--model")
-        if idx + 1 < len(rest):
-            model_dir = rest[idx + 1]
-            del rest[idx:idx + 2]
-    engine = Engine(model_dir=model_dir)
-    arch = getattr(engine.model.enc.config, "_name_or_path", model_dir)
-    if rest:
-        phrase = " ".join(rest)
-        t = time.perf_counter()
-        res = engine.predict_one(phrase)
-        dt = time.perf_counter() - t
-        ml_log.log_result(res)
-        show(res, dt)
-        return 0
-    print(f'Loaded model from "{model_dir}" ({arch}). Type a phrase; "exit" to quit.')
-    while True:
-        try:
-            line = input("ml> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
-        if line.lower() in {"выход", "exit", "quit", "q"}:
-            return 0
-        if line:
-            t = time.perf_counter()
-            res = engine.predict_one(line)
-            dt = time.perf_counter() - t
-            ml_log.log_result(res)
-            show(res, dt)
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))

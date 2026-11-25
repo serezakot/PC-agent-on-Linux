@@ -42,7 +42,7 @@ def LL(phrase, tag="llm"):
 
 
 def expected_kind(c: Case):
-    """Какой вид плана должен получиться у gogle_search для этого случая (None — браузер не открывается)."""
+    """Какой вид плана должен получиться у браузера (jarvis.browser) для этого случая (None — браузер не открывается)."""
     if c.route == "translate":
         return "translate"
     if c.route != "browser":

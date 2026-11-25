@@ -6,17 +6,18 @@ import datetime as dt
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
-import sys
 import time
 import unicodedata
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import CLIPBOARD_STATE_FILE, KEY_LEFTCTRL, KEY_S, SystemCommandError, SystemPlan, _find_projects_dir, _find_removable_media, _latest_entry, _norm, _norm_stemmed, _register, _send_keys_or_xdotool, find_local_item  # noqa: F401
+from ..apps import best_spoken_match
+
+from .core import (
+    CLIPBOARD_STATE_FILE, SYSTEM_CLIPBOARD, KEY_LEFTCTRL, KEY_S, SystemCommandError, SystemPlan, _find_projects_dir,
+    _find_removable_media, _latest_entry, _norm, _norm_stemmed, _register, _send_keys_or_xdotool, find_local_item,
+)
 
 # =============================================================================
 # 3. Поиск и операции с файлами и папками (Unicode NFKC + буфер обмена + диск)
@@ -65,17 +66,66 @@ def _resolve_folder_hint(place: str, home: Path, dirs: dict[str, Path]) -> tuple
         return ("folder", home)
     if any(w in p for w in ("флешк", "диск д", "диск d", "внешний диск")):
         return ("folder", _find_removable_media())
-    if any(w in p for w in ("проект", "projects")):
-        return ("folder", _find_projects_dir(home))
-    # Проверим существующую подпапку в стандартных директориях
+    # Существующая подпапка с таким именем важнее общих слов («проекты» на рабочем столе, а не ~/Projects)
     for base in (dirs["DESKTOP"], dirs["DOCUMENTS"], dirs["DOWNLOAD"], home):
         cand = base / place.strip(" ,.;:!?«»\"'")
         if cand.is_dir():
             return ("folder", cand)
+    if any(w in p for w in ("проект", "projects")):
+        return ("folder", _find_projects_dir(home))
     return ("custom", dirs["DOCUMENTS"] / place.strip(" ,.;:!?«»\"'").capitalize())
 
 
-def _find_target_item(
+def _allowed_roots(home: Path) -> tuple[Path, ...]:
+    user = os.environ.get("USER") or Path.home().name
+    roots = [home, Path("/media"), Path(f"/run/media/{user}")]
+    out = []
+    for r in roots:
+        try:
+            out.append(r.resolve())
+        except OSError:
+            pass
+    return tuple(out)
+
+
+def _inside_allowed(path: Path, home: Path) -> bool:
+    """Путь (после разрешения символических ссылок) внутри домашней папки или на сменном носителе."""
+    try:
+        real = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return any(real == r or r in real.parents for r in _allowed_roots(home))
+
+
+def _hidden_or_secret(path: Path, home: Path) -> bool:
+    """Скрытые файлы и папки (~/.ssh, ~/.config/...) и секреты голосом не копируем, не переносим и не удаляем: так их нельзя
+    ни испортить случайно, ни вынести в видимую папку, откуда второй слой прочитал бы их и отправил в облачную LLM."""
+    from ..sys_query import SENSITIVE
+    try:
+        real = path.resolve()
+        rel = real.relative_to(home.resolve()) if home.resolve() in real.parents or real == home.resolve() else None
+    except (OSError, RuntimeError):
+        return True
+    parts = rel.parts if rel is not None else real.parts
+    low = str(real).lower()
+    return any(p_.startswith(".") for p_ in parts) or any(m in low for m in SENSITIVE)
+
+
+def _find_target_item(name: str, home: Path, dirs: dict[str, Path], want_dir: bool | None = None,
+                      prefer_root: Path | None = None) -> Path:
+    """Файл/папка пользователя по имени. Всё, что на деле лежит вне домашней папки (в т.ч. через символическую ссылку),
+    считается ненайденным; слишком длинное или странное имя — тоже (а не ошибка ОС)."""
+    fallback = dirs["DOCUMENTS"] / (Path((name or "").strip() or "Новый_элемент").name[:200] or "Новый_элемент")
+    try:
+        found = _find_target_item_raw(name, home, dirs, want_dir=want_dir, prefer_root=prefer_root)
+        if found.exists() and (not _inside_allowed(found, home) or _hidden_or_secret(found, home)):
+            return fallback
+        return found
+    except OSError:
+        return fallback
+
+
+def _find_target_item_raw(
     name: str,
     home: Path,
     dirs: dict[str, Path],
@@ -90,6 +140,20 @@ def _find_target_item(
         raw,
         flags=re.I,
     ).strip()
+
+    # Точный путь (его передаёт второй слой после list_folder/find_files): берём как есть, но только внутри домашней
+    # папки или на сменных носителях — системные файлы этими командами не трогаем.
+    if raw.startswith(("/", "~")):
+        exact = Path(raw).expanduser()
+        allowed = (home.resolve(), Path("/media").resolve())
+        try:
+            real = exact.resolve()
+        except OSError:
+            real = exact
+        if exact.exists() and any(real == a or a in real.parents for a in allowed):
+            if want_dir is None or exact.is_dir() == want_dir:
+                return exact
+
     n_norm = _nfkc_norm(raw)
 
     roots: list[Path] = []
@@ -135,6 +199,7 @@ def _find_target_item(
 
     # Двухпроходный поиск: 1) с учётом want_dir (если задан), 2) любой тип (файл или папка), чтобы «файл ml_model» находил и папку ml_model!
     passes = [want_dir, None] if want_dir is not None else [None]
+    partial_any: Path | None = None
     for dir_filter in passes:
         # Сначала точное совпадение на верхнем уровне и на глубине 1 в Desktop/Downloads/Documents/home
         search_dirs = list(roots)
@@ -163,12 +228,30 @@ def _find_target_item(
                         continue
                     if item_full == base_q or item_base == base_q or item_stem == base_stem:
                         return item
-                    if partial_match is None and len(base_q) >= 3 and (base_q in item_full or item_base in base_q):
+                    # часть имени: сказанное входит в имя («отчет» -> отчет_2024.pdf) или имя — целыми словами большая часть
+                    # сказанного (но не «ml» из «трейнинг ml»: так нашлась бы чужая папка ml)
+                    if partial_match is None and len(base_q) >= 3 and (
+                            base_q in item_full
+                            or (len(item_base) >= 0.6 * len(base_q) and re.search(rf"(?<!\w){re.escape(item_base)}(?!\w)", base_q))):
                         partial_match = item
             except OSError:
                 continue
-        if partial_match is not None:
-            return partial_match
+        if partial_any is None:
+            partial_any = partial_match
+
+    # Похожее по звучанию имя (голос: «эдьюкейшн» = education, «мейн.py» = main.py, «трейнинг ml» = traning ml)
+    shallow: list[Path] = []
+    for root in search_dirs:
+        try:
+            shallow.extend(root.iterdir())
+        except OSError:
+            continue
+    for dir_filter in passes:
+        hit = best_spoken_match(base_q, shallow, want_dir=dir_filter, exts=wanted_exts)
+        if hit is not None:
+            return hit
+    if partial_any is not None:
+        return partial_any
 
     # Ограниченный по времени поиск по всей домашней папке (глубина 5, без скрытых и служебных каталогов)
     deep = _deep_find(raw, base_q, base_stem, home, want_dir, wanted_exts)
@@ -180,7 +263,8 @@ def _find_target_item(
     clean_title = raw if ("." in raw or any(c.isupper() for c in raw)) else (base_q.capitalize() if want_dir else base_q)
     if wanted_exts and not any(clean_title.lower().endswith(ext) for ext in wanted_exts):
         clean_title = f"{clean_title}{wanted_exts[0]}"
-    return target_root / (clean_title or "Новый_элемент")
+    # только имя: путь вне дома / несуществующий иначе «победит» при склейке (root / "/etc/x" == "/etc/x")
+    return target_root / (Path(clean_title).name or "Новый_элемент")
 
 
 # --- Файловые операции через GNOME Files (org.gnome.Nautilus.FileOperations2): нативный прогресс, отмена (Ctrl+Z), корзина ---
@@ -280,6 +364,8 @@ def _clipboard_files_set(op: str, paths: list[Path]) -> str:
         )
     except OSError:
         pass
+    if not SYSTEM_CLIPBOARD:
+        return "state"
     if shutil.which("wl-copy"):
         try:
             subprocess.run(["wl-copy", "--type", "x-special/gnome-copied-files"], input=gnome_payload,
@@ -298,7 +384,17 @@ def _clipboard_files_set(op: str, paths: list[Path]) -> str:
 
 
 def _clipboard_files_get() -> tuple[str, list[Path]]:
-    """(op, paths): что сейчас скопировано/вырезано — сначала настоящий буфер (wl-paste / xclip), затем наш файл состояния."""
+    """(op, paths): что сейчас скопировано/вырезано. Только что (до 5 с) записанное нами — из файла состояния: wl-copy
+    захватывает буфер не мгновенно, и «вырежи А и вставь в Б» подряд иначе вставило бы прежнее содержимое буфера.
+    Иначе — настоящий буфер (пользователь мог скопировать в GNOME Files), затем файл состояния."""
+    state_op, state_paths, state_t = "", [], 0.0
+    try:
+        state = json.loads(CLIPBOARD_STATE_FILE.read_text(encoding="utf-8"))
+        state_op, state_paths, state_t = state.get("op", "copy"), [Path(x) for x in state.get("paths", [])], float(state.get("t", 0))
+    except (OSError, ValueError, TypeError):
+        pass
+    if state_paths and (time.time() - state_t < 5.0 or not SYSTEM_CLIPBOARD):
+        return state_op, state_paths
     payload = ""
     for cmd in (["wl-paste", "--no-newline", "--type", "x-special/gnome-copied-files"],
                 ["xclip", "-selection", "clipboard", "-t", "x-special/gnome-copied-files", "-o"]):
@@ -317,13 +413,8 @@ def _clipboard_files_get() -> tuple[str, list[Path]]:
             paths = [Path(unquote(urlparse(u).path)) for u in lines[1:] if u.startswith("file://")]
             if paths:
                 return lines[0], paths
-    try:
-        state = json.loads(CLIPBOARD_STATE_FILE.read_text(encoding="utf-8"))
-        paths = [Path(x) for x in state.get("paths", [])]
-        if paths:
-            return state.get("op", "copy"), paths
-    except (OSError, ValueError):
-        pass
+    if state_paths:
+        return state_op, state_paths
     return "", []
 
 
@@ -447,7 +538,17 @@ def _clean_place(site: str) -> str:
 
 
 def _dest_dir_from_site(site: str, home: Path, dirs: dict[str, Path]) -> Path | None:
-    """Папка назначения из слота site: стандартное место («рабочий стол», «downloads») или папка пользователя по имени."""
+    """Папка назначения из слота site; вне домашней папки (и сменных носителей) — отказ, туда ассистент не пишет."""
+    try:
+        dest = _dest_dir_from_site_raw(site, home, dirs)
+    except OSError:
+        raise SystemCommandError("не понимаю, что это за папка назначения") from None
+    if dest is not None and not _inside_allowed(dest, home):
+        raise SystemCommandError("папка назначения вне домашней папки, туда я не пишу")
+    return dest
+
+
+def _dest_dir_from_site_raw(site: str, home: Path, dirs: dict[str, Path]) -> Path | None:
     if not site:
         return None
     site = _clean_place(site)
@@ -477,7 +578,9 @@ def _is_source_form(site: str) -> bool:
 def _h_fs_copy(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
     """«скопируй X» -> в буфер обмена (как Ctrl+C в GNOME Files); «скопируй X на рабочий стол / в папку Y» -> копия на диск."""
     dest_dir = _dest_dir_from_site(site, home, dirs)
-    src_path = _find_target_item(query, home, dirs, want_dir=None, prefer_root=dest_dir)
+    # «с рабочего стола» — откуда (ищем там в первую очередь); «в документы» — куда: источник там НЕ ищем первым,
+    # иначе одноимённый файл из папки назначения «копируется сам в себя»
+    src_path = _find_target_item(query, home, dirs, want_dir=None, prefer_root=dest_dir if _is_source_form(site) else None)
     # Слот site бывает и «куда» («на рабочий стол»), и «откуда» («с рабочего стола»): различаем по падежу самого слота.
     is_source_place = dest_dir is not None and (_is_source_form(site) or (
         src_path.parent.resolve() == dest_dir.resolve() and not re.search(r"[а-яё]", site.lower())))
@@ -489,7 +592,7 @@ def _h_fs_copy(query: str, site: str, home: Path, dirs: dict[str, Path]) -> Syst
         if has_dest:
             dest_dir.mkdir(parents=True, exist_ok=True)
             final_dst = dest_dir / src_path.name
-            if _fo_copy([src_path], dest_dir) and _wait_exists(final_dst, 6.0):
+            if not final_dst.exists() and _fo_copy([src_path], dest_dir) and _wait_exists(final_dst, 6.0):
                 return f"Скопировано: {src_path} -> {dest_dir}"
             final_dst = _unique_copy_dest(src_path, dest_dir)
             if src_path.is_dir():
@@ -550,6 +653,11 @@ def _h_fs_move(query: str, site: str, home: Path, dirs: dict[str, Path]) -> Syst
         if src_path.resolve() == dst_dir.resolve() or src_path.parent.resolve() == dst_dir.resolve():
             return f"«{src_path.name}» уже находится в {dst_dir}"
         dst_dir.mkdir(parents=True, exist_ok=True)
+        if (dst_dir / src_path.name).exists():
+            # там уже есть такое имя: не перезаписываем, кладём рядом под новым именем
+            alt = _unique_copy_dest(src_path, dst_dir)
+            shutil.move(str(src_path), str(alt))
+            return f"Перемещено: {src_path} -> {alt} (имя «{src_path.name}» в папке назначения уже занято)"
         if _fo_move([src_path], dst_dir) and _wait_gone(src_path, 6.0):
             return f"Перемещено: {src_path} -> {dst_dir}"
         shutil.move(str(src_path), str(dst_path))
@@ -601,6 +709,9 @@ def _h_fs_rename(query: str, site: str, home: Path, dirs: dict[str, Path]) -> Sy
 
 @_register("fs_trash", "fs_delete")
 def _h_fs_delete(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
+    if not _nfkc_norm((query or "").strip(" ,.;:!?«»\"'")):
+        # «удали» без объекта: НЕ угадываем «последний файл» — удаление по догадке хуже переспроса
+        raise SystemCommandError("не сказано, что удалить: назовите файл или папку")
     prefer_dir = _dest_dir_from_site(site, home, dirs)
     target_path = _find_target_item(query, home, dirs, want_dir=None, prefer_root=prefer_dir)
 

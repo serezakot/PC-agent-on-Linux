@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Пишешь команду обычными словами -> наша модель (папка ml/) понимает, что и где искать -> открывается Firefox.
+"""Браузер: по решению модели (сайт, запрос, текст, язык) открывается Firefox.
 
     открой ютуб и найди linkin park       -> поиск «linkin park» внутри YouTube
     запусти саунд клауд                    -> просто открыть сайт
@@ -11,8 +10,7 @@
 
 Сайт не назван, есть запрос («загугли …», «поищи в интернете …», «включи …»)
 ------------------------------------------------------------------------------
-Открывается страница результатов Google: https://www.google.com/search?q=запрос. Раньше здесь стоял режим «Мне повезёт»
-(btnI=1) — он сам уводил на первый сайт из выдачи, поэтому «загугли» не гуглил. Теперь «Мне повезёт» используется
+Открывается страница результатов Google: https://www.google.com/search?q=запрос. «Мне повезёт» (btnI=1) используется
 только для одного: узнать, какой сайт имелся в виду, когда пользователь назвал его («ютуб», «алиэкспресс»).
 Если Google не ответил на такой вопрос — открывается ссылка «Мне повезёт» через Google (может появиться страница
 «Redirect Notice»).
@@ -34,37 +32,21 @@
   4) не нашли — спрашиваем Google «site:домен запрос»;
   5) Google не ответил — открывается обычная ссылка через Google.
 Найденное запоминается до конца работы программы.
-
-Модель
-------
-Лежит в ml/ml_model/ (или рядом в ml_model/, её создаёт обучение: python3 ml_train.py --mode final --arch small).
-Модель лениво грузится при первой команде. Нет модели — программа так и скажет. Нужны torch и transformers.
-
-Запуск:
-    python3 gogle_search.py                                  # диалог
-    python3 gogle_search.py "открой ютуб и найди linkin park"
-    python3 gogle_search.py --dry-run "открой ютуб и найди linkin park"   # только показать ссылку (без сети и браузера)
 """
 import json
 import re
 import shutil
-import subprocess
-import sys
-import tempfile
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from pathlib import Path
 from urllib.parse import (parse_qs, quote, quote_plus, urlencode, urljoin, urlparse,
                           urlsplit, urlunsplit)
 
 SEARCH_URL = "https://www.google.com/search"
 TRANSLATE_URL = "https://translate.google.com/"
-EXIT_WORDS = {"exit", "выход"}
-LAUNCH_WAIT_SECONDS = 3.0
 HTTP_TIMEOUT_SECONDS = 6.0
 PAGE_TIMEOUT_SECONDS = 8.0
 MAX_PAGE_BYTES = 1_500_000
@@ -531,10 +513,6 @@ def _template_from_page(page_url: str, html: str, fetch) -> tuple[str, str] | No
 _TEMPLATE_CACHE: dict[str, tuple[str, str] | None] = {}
 
 
-def clear_cache() -> None:
-    _TEMPLATE_CACHE.clear()
-
-
 def find_search_template(page_url: str, fetch=None) -> tuple[str, str] | None:
     """Выясняет по странице сайта, как искать на нём. -> (шаблон с {searchTerms}, способ) или None.
 
@@ -820,55 +798,16 @@ def make_plan(
 # =============================================================================
 # Запуск браузера
 # =============================================================================
-def _launch(cmd: list[str], wait_seconds: float = LAUNCH_WAIT_SECONDS) -> str | None:
-    """Запускает команду. None — успех, иначе текст ошибки.
-
-    Если процесс ещё работает через wait_seconds — значит Firefox стартует
-    (это нормально, особенно для snap-версии), считаем запуск успешным.
-    Если завершился с кодом 0 — команда передана уже открытому Firefox.
-    Если завершился с ошибкой — возвращаем её текст.
-    """
-    try:
-        with tempfile.TemporaryFile() as err:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=err,
-                start_new_session=True,
-            )
-            try:
-                code = proc.wait(timeout=wait_seconds)
-            except subprocess.TimeoutExpired:
-                return None
-            if code == 0:
-                return None
-            err.seek(0)
-            message = err.read().decode(errors="replace").strip()
-            return f"{cmd[0]} завершился с кодом {code}: {message[-300:]}"
-    except OSError as exc:
-        return f"{cmd[0]}: {exc}"
-
-
 def open_in_browser(url: str) -> None:
-    """Открывает ссылку в Firefox; если не вышло — через xdg-open.
-
-    Бросает BrowserError, если ничего не сработало.
-    """
-    candidates = []
-    for name in ("firefox", "xdg-open"):
-        path = shutil.which(name)
-        if path:
-            candidates.append([path, url])
+    """Открывает ссылку в Firefox (не вышло — xdg-open) и сразу возвращается: окно появляется, пока Джарвис отвечает;
+    если браузер всё-таки не открылся, об этом скажет apps.late_failure. BrowserError — если не запустилось ничего."""
+    candidates = [[path, url] for path in (shutil.which("firefox"), shutil.which("xdg-open")) if path]
     if not candidates:
         raise BrowserError("не найден ни firefox, ни xdg-open")
-
-    errors = []
-    for cmd in candidates:
-        error = _launch(cmd)
-        if error is None:
-            return
-        errors.append(error)
-    raise BrowserError("; ".join(errors))
+    from .apps import spawn_watched                    # noqa: PLC0415
+    error = spawn_watched(candidates, "браузер")
+    if error is not None:
+        raise BrowserError(error)
 
 
 _SOURCE_NAMES = {"opensearch": "OpenSearch", "jsonld": "SearchAction", "form": "форма поиска"}
@@ -899,136 +838,13 @@ def _describe(plan: Plan) -> str:
     return f"Открываю: {plan.url}"
 
 
-# =============================================================================
-# Модель: фраза -> что делать
-# =============================================================================
-_HERE = Path(__file__).resolve().parent
-ML_DIR = _HERE if (_HERE / "ml_model" / "heads.pt").exists() or (_HERE / "ml_infer.py").exists() else _HERE / "ml"
-
-
-class ModelError(RuntimeError):
-    """Обученной модели нет или она не загрузилась."""
-
-
-def model_parse(phrase: str) -> dict:
-    """Фраза -> решение модели: {"route": browser|translate|llm, "site", "query", "text", "lang", "fallback", ...}.
-
-    Тяжёлые torch/transformers грузятся только здесь, при первой команде. Журнал команд (parse_log.jsonl) пишется сам.
-    """
-    ml_dir = _HERE if (_HERE / "ml_model" / "heads.pt").exists() else ML_DIR
-    if not (ml_dir / "ml_model" / "heads.pt").exists():
-        raise ModelError(f"нет обученной модели: {ml_dir / 'ml_model'}. Положите сюда папку ml_model "
-                         "или обучите: python3 ml_gen.py --mode final && python3 ml_train.py --mode final --arch small")
-    if str(ml_dir) not in sys.path:
-        sys.path.insert(0, str(ml_dir))
-    try:
-        import ml_infer
-        import ml_log
-    except ImportError as exc:
-        raise ModelError(f"не хватает пакета для модели ({exc}). Установите: pip install -r requirements.txt") from exc
-    result = ml_infer.get_engine(str(ml_dir / "ml_model")).predict_one(phrase)
-    ml_log.log_result(result)
-    return result
-
-
-def handle_phrase(phrase: str, parser=model_parse, opener=open_in_browser, resolver=None, finder=None):
-    """Одна фраза от начала до конца. Возвращает (решение модели, план или None).
-
-    browser   -> поиск в Google / сайт / поиск на сайте / первое видео или канал на YouTube;
-    translate -> Google Переводчик с подставленными текстом и языком;
-    остальное -> браузер не открывается, план None.
-    """
-    result = parser(phrase)
+def plan_for(result: dict, resolver=None, finder=None) -> Plan | None:
+    """Решение модели -> что открыть: browser — сайт / поиск / YouTube, translate — переводчик; иначе (или пусто) None.
+    resolver/finder подменяются в тестах (без сети)."""
     route = result.get("route")
     if route == "browser":
-        action = result.get("action") or "web_search"
-        plan = make_plan(result.get("site", ""), result.get("query", ""), resolver, finder, action=action)
-    elif route == "translate":
-        plan = make_translate_plan(result.get("text", ""), result.get("lang", "none"))
-    else:
-        return result, None
-    if plan is not None:
-        opener(plan.url)
-    return result, plan
-
-
-def describe_decision(result: dict) -> str:
-    """Одна строка о решении модели для терминала (используется и assistant.py)."""
-    route = result.get("route")
-    act = result.get("action") or ""
-    act_str = f" [{act}]" if act and act != "none" else ""
-    extra = {
-        "browser": f"сайт={result.get('site') or '—'}, запрос={result.get('query') or '—'}",
-        "translate": f"текст={result.get('text')!r}, язык={result.get('lang')}",
-        "app": f"приложение/папка={result.get('site') or '—'}, действие={result.get('query') or '—'}",
-        "system": f"цель={result.get('query') or '—'}, место={result.get('site') or '—'}"
-                  + (f", текст={result.get('text')!r}" if result.get("text") else ""),
-        "llm": "отправляю большой LLM (пока не подключена)",
-    }.get(route, "отправляю большой LLM (пока не подключена)")
-    note = f"  [страховка: {result['reason']}]" if result.get("fallback") else ""
-    return f"модель: {route}{act_str} · {extra}{note}"
-
-
-def _run(phrase: str, opener, dry_run: bool) -> bool:
-    """Обрабатывает одну фразу. True — всё хорошо (или фраза пустая)."""
-    if not normalize_query(phrase):
-        return True
-    resolver = (lambda url: None) if dry_run else None      # --dry-run: без сети
-    try:
-        result, plan = handle_phrase(phrase, model_parse, opener, resolver)
-    except ModelError as exc:
-        print(f"Ошибка: {exc}")
-        return False
-    except BrowserError as exc:
-        print(f"Ошибка: не удалось открыть браузер — {exc}")
-        return False
-    print(describe_decision(result))
-    route = result.get("route")
-    if route in ("app", "system"):
-        print("Это команда для программ или системы: запустите assistant.py (этот модуль отвечает только за браузер).")
-        return True
-    if plan is None:
-        if route == "browser":
-            print("Искать нечего.")
-        elif route == "translate":
-            print("Переводить нечего.")
-        return True
-    print(plan.url if dry_run else _describe(plan))
-    return True
-
-
-def main(argv: list[str]) -> int:
-    dry_run = "--dry-run" in argv
-    args = [a for a in argv if a != "--dry-run"]
-    opener = (lambda url: None) if dry_run else open_in_browser
-
-    if args:  # фраза передана аргументами
-        text = " ".join(args)
-        if not normalize_query(text):
-            print("Пустой запрос.")
-            return 1
-        return 0 if _run(text, opener, dry_run) else 1
-
-    try:
-        sys.stdin.reconfigure(errors="replace")
-    except (AttributeError, ValueError):
-        pass
-    try:
-        import readline  # noqa: F401
-    except ImportError:
-        pass
-
-    print("Скажи команду обычными словами (exit или выход — закрыть).")
-    while True:
-        try:
-            query = input("> ").replace("\ufffd", "")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
-        if normalize_query(query).lower() in EXIT_WORDS:
-            return 0
-        _run(query, opener, dry_run)
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+        return make_plan(result.get("site", ""), result.get("query", ""), resolver, finder,
+                         action=result.get("action") or "web_search")
+    if route == "translate":
+        return make_translate_plan(result.get("text", ""), result.get("lang", "none"))
+    return None

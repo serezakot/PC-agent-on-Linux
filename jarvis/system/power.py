@@ -2,20 +2,12 @@
 режим «не выключай экран»."""
 from __future__ import annotations
 
-import datetime as dt
 import json
-import os
-import re
-import shlex
 import shutil
 import subprocess
-import sys
-import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import CLIPBOARD_STATE_FILE, SystemPlan, _norm, _parse_delay_minutes, _register  # noqa: F401
+from .core import CLIPBOARD_STATE_FILE, SystemPlan, _norm, _parse_delay_minutes, _register, parse_duration
 
 # --- 4.3. Профили питания ---
 @_register("power_perf")
@@ -107,6 +99,14 @@ def _h_power_cancel(query: str, site: str, home: Path, dirs: dict[str, Path]) ->
 
 @_register("power_sleep")
 def _h_power_sleep(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
+    """«усыпи компьютер» — сразу; «усыпи через час» — отложенно (таймер systemd пользователя, переживает выход ассистента)."""
+    if parse_duration(query, bare_unit=60):
+        mins = _parse_delay_minutes(query, default=10)
+        return SystemPlan(
+            category="power", action="suspend_delayed",
+            description=f"Планирую спящий режим через {mins} мин.",
+            commands=(("systemd-run", "--user", "--unit=pc-agent-sleep", "--collect", f"--on-active={mins}m", "systemctl", "suspend"),),
+        )
     return SystemPlan(
         category="power",
         action="suspend",
@@ -178,12 +178,23 @@ def _h_session_logout(query: str, site: str, home: Path, dirs: dict[str, Path]) 
 
 @_register("session_switch_user")
 def _h_session_switch_user(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
+    def _op() -> str:
+        for cmd in (("gdmflexiserver",), ("dm-tool", "switch-to-greeter")):
+            if shutil.which(cmd[0]) and subprocess.run(list(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                       timeout=8.0, check=False).returncode == 0:
+                return "Открыла экран выбора пользователя"
+        # В GNOME 46 без gdmflexiserver прямого «сменить пользователя» нет: блокируем экран, на нём есть вход другим
+        if subprocess.run(["loginctl", "lock-session"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8.0,
+                          check=False).returncode == 0:
+            return "Заблокировала экран: войдите под другим пользователем с экрана блокировки"
+        raise SystemCommandError("не удалось перейти к выбору пользователя")
     return SystemPlan(
         category="power",
         action="switch_user",
-        description="Переключаю экран выбора пользователя (gdmflexiserver)",
-        commands=(("dm-tool", "switch-to-greeter"),),
+        description="Перехожу к выбору пользователя (экран входа или блокировки)",
+        commands=(("gdmflexiserver",),),
         fallback_commands=(("loginctl", "lock-session"),),
+        python_op=_op,
     )
 
 

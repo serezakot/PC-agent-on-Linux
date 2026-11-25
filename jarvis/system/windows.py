@@ -2,20 +2,18 @@
 обзор, прилепить влево / вправо, поверх всех, рабочие столы, браузер."""
 from __future__ import annotations
 
-import datetime as dt
-import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
-import sys
-import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import KEY_D, KEY_ESC, KEY_F11, KEY_F4, KEY_H, KEY_LEFT, KEY_LEFTALT, KEY_LEFTMETA, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_SPACE, KEY_TAB, KEY_UP, SystemCommandError, SystemPlan, _MUTTER, _SHELL, _TILING, _WM, _binding_combo, _register, _send_keys_or_xdotool, _wayland_send_keycodes, resolve_close_patterns  # noqa: F401
+from ..apps import browser_close_patterns, find_steam_game, resolve_program
+from .core import (
+    KEY_D, KEY_ESC, KEY_F11, KEY_F4, KEY_H, KEY_LEFT, KEY_LEFTALT, KEY_LEFTMETA, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT,
+    KEY_SPACE, KEY_TAB, KEY_UP, SystemCommandError, SystemPlan, _MUTTER, _SHELL, _TILING, _WM, _binding_combo,
+    _register, _send_keys_or_xdotool, _wayland_send_keycodes, resolve_close_patterns,
+)
 
 # --- 4.9. Управление окнами, рабочими столами и закрытием программ ---
 def _pkill_pattern(pat: str) -> str:
@@ -26,14 +24,52 @@ def _pkill_pattern(pat: str) -> str:
     return rf"(^|/){pat}(\s|$)"
 
 
-def _close_app_op(name: str) -> str:
-    patterns = resolve_close_patterns(name)
+# Процессы, без которых рушится сессия, звук, сеть или сам ассистент: «закрой X» их не трогает никогда.
+_PROTECTED = {
+    "systemd", "init", "dbus-daemon", "dbus-broker", "gnome-shell", "gnome-session", "gnome-session-binary", "gdm", "gdm3",
+    "mutter", "xwayland", "xorg", "pipewire", "pipewire-pulse", "wireplumber", "pulseaudio", "networkmanager", "polkitd",
+    "gnome-keyring-daemon", "ssh-agent", "gvfsd", "at-spi-bus-launcher", "ibus-daemon", "login", "sudo", "su",
+    "bash", "sh", "zsh", "fish", "dash", "python", "python3", "node", "java", "perl", "ruby", "snapd", "snap", "flatpak",
+    "gsd-power", "gsd-media-keys", "xdg-desktop-portal", "xdg-desktop-portal-gnome", "xdg-document-portal",
+}
+
+
+def _is_protected(pattern: str) -> bool:
+    base = re.sub(r"\\(.)", r"\1", pattern).rsplit("/", 1)[-1].casefold()
+    return base in _PROTECTED or len(base) < 3
+
+
+def _own_ancestors() -> set[int]:
+    """Сам ассистент и все его родители (терминал, оболочка): их закрытие убило бы ассистента."""
+    pids, pid = set(), os.getpid()
+    for _ in range(32):
+        pids.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if pid <= 1:
+            break
+    return pids
+
+
+def _safe_close_patterns(name: str) -> list[str]:
+    if _is_protected(name.strip()):                     # «закрой pipewire» — отказ, а не «похожая» программа qpwgraph
+        return []
+    return [p_ for p_ in resolve_close_patterns(name) if not _is_protected(p_)]
+
+
+def _close_app_op(name: str, patterns: list[str] | None = None) -> str:
+    patterns = patterns if patterns is not None else _safe_close_patterns(name)
     if not patterns:
+        if resolve_close_patterns(name) or _is_protected(name.strip()):
+            raise SystemCommandError(f"«{name}» — системный процесс, его закрывать нельзя")
         raise SystemCommandError(f"не нашла программу «{name}» среди установленных, чтобы закрыть её")
-    own = os.getpid()
+    keep = _own_ancestors()
     for pat in patterns:
         res = subprocess.run(["pgrep", "-f", _pkill_pattern(pat)], capture_output=True, text=True, timeout=4.0, check=False)
-        pids = [int(x) for x in (res.stdout or "").split() if x.isdigit() and int(x) != own]
+        pids = [int(x) for x in (res.stdout or "").split() if x.isdigit() and int(x) not in keep]
         if not pids:
             continue
         for pid in pids:
@@ -45,28 +81,72 @@ def _close_app_op(name: str) -> str:
     return f"Программа «{name}» сейчас не запущена"
 
 
+def _app_names(name: str) -> list[str]:
+    """Перечисление программ: «дискорд, телеграм и стим» и голосом без запятых «дискорд телеграм и стим» -> три имени.
+    Делится, только если каждая часть — программа; одно длинное имя («visual studio code») не делится."""
+    if _is_protected(name.strip()):
+        return [name]
+    out: list[str] = []
+    for part in (p_.strip() for p_ in re.split(r"\s*,\s*|\s+и\s+|\s+а также\s+", name) if p_.strip()):
+        words = part.split()
+        if len(words) > 1 and all(resolve_program(w) or find_steam_game(w) for w in words) \
+                and not (resolve_program(part) or find_steam_game(part)):
+            out.extend(words)
+        else:
+            out.append(part)
+    if len(out) > 1 and all(resolve_close_patterns(n) or _is_protected(n) for n in out):
+        return out
+    return [name]
+
+
+def _close_apps_op(names: list[str]) -> str:
+    done, problems = [], []
+    for n in names:
+        try:
+            done.append(_close_app_op(n))
+        except SystemCommandError as exc:
+            problems.append(str(exc))
+    if not done:
+        raise SystemCommandError("; ".join(problems))
+    return "; ".join(done + problems)
+
+
 @_register("win_close_app", "app_close")
 def _h_app_close(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
     name = (query or site or "").strip(" ,.;:!?«»\"'")
     if not name:
         return _h_win_close(query, site, home, dirs)
-    patterns = resolve_close_patterns(name)
+    names = _app_names(name)
+    if len(names) > 1:
+        pats = [pat for n in names for pat in _safe_close_patterns(n)]
+        return SystemPlan(category="window", action="close_app",
+                          description="Закрываю " + ", ".join(f"«{n}»" for n in names),
+                          commands=tuple(("pkill", "-TERM", "-f", _pkill_pattern(pat)) for pat in pats),
+                          python_op=lambda names=tuple(names): _close_apps_op(list(names)))
+    patterns = _safe_close_patterns(name)
+    if not patterns:
+        why = "системный процесс, закрывать нельзя" if (resolve_close_patterns(name) or _is_protected(name)) else "программа не найдена"
+        return SystemPlan(category="window", action="close_app", description=f"Не закрываю «{name}»: {why}",
+                          commands=(), python_op=lambda name=name: _close_app_op(name))
     return SystemPlan(
         category="window",
         action="close_app",
         description=f"Закрываю приложение «{name}»",
-        commands=tuple(("pkill", "-TERM", "-f", _pkill_pattern(pat)) for pat in patterns) or (("pkill", "-f", name),),
+        commands=tuple(("pkill", "-TERM", "-f", _pkill_pattern(pat)) for pat in patterns),
         python_op=lambda name=name: _close_app_op(name),
     )
 
 
 @_register("win_close_browser")
 def _h_win_close_browser(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
+    """Браузеры этой машины (категория WebBrowser в .desktop), шаблоны с якорями — как у «закрой X»."""
+    patterns = [p_ for p_ in browser_close_patterns() if not _is_protected(p_)]
     return SystemPlan(
         category="window",
         action="close_browser",
         description="Закрываю браузер",
-        commands=(("pkill", "-TERM", "-f", "firefox|chrome|chromium|brave|opera|vivaldi"),),
+        commands=tuple(("pkill", "-TERM", "-f", _pkill_pattern(pat)) for pat in patterns),
+        python_op=lambda patterns=patterns: _close_app_op("браузер", patterns),
     )
 
 
@@ -126,7 +206,7 @@ def _parent_pid(pid: int) -> int:
 def _running_gui_apps(exclude_pids: set[int]) -> list[tuple[int, str]]:
     """Открытые программы пользователя: главный процесс каждого приложения, запущенного из видимого .desktop
     (то есть из меню / дока / ассистента). Службы автозапуска и программа, в которой работает сам ассистент, не трогаются."""
-    from app_launcher import desktop_apps
+    from ..apps import desktop_apps
     apps = desktop_apps()
     visible = {a.desktop_id: a.title for a in apps}
     generic = {"env", "sh", "bash", "python", "python3", "flatpak", "snap", "gjs", "java", "electron", "xdg-open", "gtk-launch"}

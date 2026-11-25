@@ -1,20 +1,11 @@
 """Звук: громкость и микрофон (PipeWire wpctl / pactl), переключение устройства вывода."""
 from __future__ import annotations
 
-import datetime as dt
-import json
-import os
 import re
-import shlex
-import shutil
 import subprocess
-import sys
-import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import SystemCommandError, SystemPlan, _norm, _parse_percent, _register, name_similarity_safe  # noqa: F401
+from .core import SystemCommandError, SystemPlan, _norm, _parse_percent, _register, name_similarity_safe
 
 # --- 4.1. Звук и микрофон (PipeWire wpctl + PulseAudio pactl) ---
 @_register("vol_mute")
@@ -178,7 +169,7 @@ def _audio_output_op(query: str) -> str:
             wanted = techs
             break
     best = None
-    for sid, name, current in sinks:
+    for sid, name, _current in sinks:
         n = name.lower()
         score = sum(1 for t in wanted if re.search(rf"(?<![a-z]){re.escape(t)}" + (r"(?![a-z])" if len(t) <= 3 else ""), n)) * 10   # «dp» не внутри «headphones»
         score += int(round(name_similarity_safe(q, name) * 5))

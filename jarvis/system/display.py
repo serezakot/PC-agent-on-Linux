@@ -2,21 +2,17 @@
 выключение экрана, обои."""
 from __future__ import annotations
 
-import datetime as dt
 import json
-import os
 import re
-import shlex
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import SystemCommandError, SystemPlan, _adjust_brightness_op, _norm, _parse_percent, _register  # noqa: F401
-from .files import _find_target_item  # noqa: F401
+from .core import (
+    words_to_digits, SystemCommandError, SystemPlan, _adjust_brightness_op, _norm, _parse_percent, _register,
+)
+from .files import _find_target_item
 
 # --- 4.2. Яркость экрана, тема, ночной свет, масштаб, Не беспокоить ---
 @_register("bright_set")
@@ -262,6 +258,7 @@ def _parse_resolution(query: str) -> str:
     q = re.sub(r"(?<=\d)\s*х\s*(?=\d)", "x", _norm(query))     # «1920х1080» с кириллической «х», но не «хд»
     if not q:
         return ""
+    q = re.sub(r"\b(\d) ?(?:к|k|кей)\b", r"\1k", words_to_digits(q))   # «тысяча девятьсот двадцать на ...», «четыре к»
     m = re.search(r"(\d{3,4})\s*(?:x|на|по|\*)\s*(\d{3,4})", q)
     if m:
         return f"{m.group(1)}x{m.group(2)}"
@@ -348,6 +345,11 @@ def _wallpaper_op(query: str, home: Path, dirs: dict[str, Path]) -> str:
 
 @_register("wallpaper_set")
 def _h_wallpaper_set(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
-    return SystemPlan(category="display", action="wallpaper", description=f"Ставлю обои: {query or 'настройки фона'}",
-                      commands=(("gsettings", "set", "org.gnome.desktop.background", "picture-uri", query),),
+    if not _norm(query):
+        return SystemPlan(category="display", action="wallpaper", description="Открываю настройки фона (картинка не названа)",
+                          commands=(("gnome-control-center", "background"),), python_op=lambda: _wallpaper_op(query, home, dirs))
+    pic = _find_target_item(query, home, dirs, want_dir=False, prefer_root=dirs["PICTURES"])
+    uri = pic.resolve().as_uri() if pic.exists() else str(pic)
+    return SystemPlan(category="display", action="wallpaper", description=f"Ставлю обои: {pic}", target_path=str(pic),
+                      commands=(("gsettings", "set", "org.gnome.desktop.background", "picture-uri", uri),),
                       python_op=lambda: _wallpaper_op(query, home, dirs))

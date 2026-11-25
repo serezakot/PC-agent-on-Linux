@@ -5,16 +5,11 @@ import datetime as dt
 import json
 import os
 import re
-import shlex
-import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import SystemCommandError, SystemPlan, _find_removable_media, _register  # noqa: F401
+from .core import SystemCommandError, SystemPlan, _find_removable_media, _register
 
 # --- Сведения о системе: диск, память, процессор, IP, батарея, версия, время ---
 # Вопросы о системе и повседневные задачи: диск, память, процессор, IP, батарея, время, таймеры, напоминания,
@@ -171,9 +166,14 @@ def _battery_op() -> str:
         msg = f"Батарея: {cap}%, {st}"
         try:
             res = subprocess.run(["upower", "-i", f"/org/freedesktop/UPower/devices/battery_{bat.name}"], capture_output=True, text=True, timeout=3.0, check=False)
-            m = re.search(r"time to (?:empty|full):\s+(.+)", res.stdout or "")
+            m = re.search(r"time to (empty|full):\s+([\d.,]+)\s*(\w+)", res.stdout or "")
             if m:
-                msg += f", осталось примерно {m.group(1).strip()}"
+                num = float(m.group(2).replace(",", "."))
+                unit = m.group(3).lower()
+                mins = num * 60 if unit.startswith("hour") else num * 24 * 60 if unit.startswith("day") else num
+                h, mm = divmod(int(round(mins)), 60)
+                span = (f"{h} ч {mm} мин" if h else f"{mm} мин") if mins >= 1 else "меньше минуты"
+                msg += f", до полной зарядки примерно {span}" if m.group(1) == "full" else f", хватит примерно на {span}"
         except (OSError, subprocess.TimeoutExpired):
             pass
         return msg

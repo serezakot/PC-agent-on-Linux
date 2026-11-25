@@ -1,4 +1,4 @@
-"""Интеграционные тесты файловых операций system_control на настоящей Ubuntu (временная «домашняя папка»).
+"""Интеграционные тесты файловых операций jarvis.system на настоящей Ubuntu (временная «домашняя папка»).
 
 Проверяют весь путь (action, query, site) -> план -> выполнение: создание папки/файла, копирование в папку и в буфер,
 перемещение, переименование, корзина, архив и распаковка, свойства. Запуск: python3 -m pytest tests/test_system_fs.py -q
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 for p in (ROOT, ROOT / "ml"):
     sys.path.insert(0, str(p))
 
-import system_control as S  # noqa: E402
+from jarvis import system as S  # noqa: E402
 
 
 class TestFileOps(unittest.TestCase):

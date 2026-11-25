@@ -1,34 +1,46 @@
 """Медиа: пауза, следующий / предыдущий трек, перемотка, субтитры, полный экран, скорость (MPRIS + мультимедийные клавиши)."""
 from __future__ import annotations
 
-import datetime as dt
-import json
-import os
-import re
-import shlex
-import shutil
-import subprocess
-import sys
-import time
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
 
-from .core import KEY_C, KEY_COMMA, KEY_DOT, KEY_F, KEY_LEFT, KEY_LEFTSHIFT, KEY_N, KEY_NEXTSONG, KEY_PLAYPAUSE, KEY_PREVIOUSSONG, KEY_RIGHT, SystemCommandError, SystemPlan, _mpris_call, _parse_seconds, _register, _send_keys_or_xdotool, _wayland_send_keycodes  # noqa: F401
+from .core import (
+    KEY_C, KEY_COMMA, KEY_DOT, KEY_F, KEY_LEFT, KEY_LEFTSHIFT, KEY_N, KEY_NEXTSONG, KEY_PLAYPAUSE, KEY_PREVIOUSSONG,
+    KEY_RIGHT, SystemCommandError, SystemPlan, _mpris_call, _parse_seconds, _register, _send_keys_or_xdotool,
+    _wayland_send_keycodes,
+)
 
 # --- 4.7. Медиа и управление видеоплеером (MPRIS + Wayland Mutter.RemoteDesktop) ---
 def _media_key_op(mpris_method: str, keycode: int, description: str, extra_combo: tuple[int, ...] | None = None) -> str:
     """Отправляет команду в MPRIS и эмулирует аппаратную мультимедийную клавишу через Wayland Mutter.RemoteDesktop."""
-    mpris_ok = _mpris_call(mpris_method)
-    key_ok = _wayland_send_keycodes((keycode,))
-    if not mpris_ok and extra_combo is not None:
-        _wayland_send_keycodes(extra_combo)
-    if mpris_ok or key_ok:
+    # Либо MPRIS, либо клавиша — не оба: GNOME передаёт медиаклавишу тому же плееру, и команда сработала бы дважды
+    # (пауза+воспроизведение = ничего, «следующий трек» = через один).
+    if _mpris_call(mpris_method):
         return description
+    key_ok = _wayland_send_keycodes((keycode,))
+    if extra_combo is not None:
+        _wayland_send_keycodes(extra_combo)
+    if key_ok:
+        return f"{description} (плеер не найден, нажата медиаклавиша)"
     raise SystemCommandError(f"не удалось выполнить медиа-команду: {description}")
 
 
-@_register("media_play_pause", "media_pause", "media_resume")
+@_register("media_pause")
+def _h_media_pause(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
+    """«пауза» — именно пауза (MPRIS Pause), а не переключатель: на уже остановленном видео ничего не включит."""
+    return SystemPlan(category="media", action="media_play_pause", description="Ставлю на паузу",
+                      commands=(("playerctl", "pause"),), fallback_commands=(("xdotool", "key", "XF86AudioPause"),),
+                      python_op=lambda: _media_key_op("Pause", KEY_PLAYPAUSE, "Поставила на паузу"))
+
+
+@_register("media_resume")
+def _h_media_resume(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
+    """«продолжи» — именно воспроизведение (MPRIS Play): на уже играющем видео не поставит паузу."""
+    return SystemPlan(category="media", action="media_play_pause", description="Продолжаю воспроизведение",
+                      commands=(("playerctl", "play"),), fallback_commands=(("xdotool", "key", "XF86AudioPlay"),),
+                      python_op=lambda: _media_key_op("Play", KEY_PLAYPAUSE, "Продолжила воспроизведение"))
+
+
+@_register("media_play_pause")
 def _h_media_play_pause(query: str, site: str, home: Path, dirs: dict[str, Path]) -> SystemPlan:
     return SystemPlan(
         category="media",

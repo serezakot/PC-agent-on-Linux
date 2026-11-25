@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Parse log: automatic recording of all phrases sent to the assistant.
 
-By default, every phrase handled by `gogle_search.py` or `ml_infer.py` is appended to `parse_log.jsonl`
+By default, every phrase parsed by the assistant (`jarvis/parser.py`) is appended to `parse_log.jsonl`
 next to the scripts (one JSON line per command: timestamp, phrase, route, site, query, text, lang,
 confidence, fallback, reason, and optional url).
 

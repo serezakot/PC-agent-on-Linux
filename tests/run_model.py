@@ -9,6 +9,7 @@
     python3 tests/run_model.py --selftest           # проверить сам отчёт на «подпорченном» парсере (без модели)
     python3 tests/run_model.py --set system         # только системные команды и программы (tests/cases_system.py)
     python3 tests/run_model.py --set browser        # только браузер / переводчик / llm
+    python3 tests/run_model.py --model ml/ml_model_new   # проверить новую модель до замены рабочей
 
 Как читать итог. У фразы пять возможных исходов:
     ok            — всё верно
@@ -31,7 +32,9 @@ for p in (ROOT / "ml", HERE):
     sys.path.insert(0, str(p))
 
 from cases import all_cases           # noqa: E402
-from cases_system import ALL as SYSTEM_CASES   # noqa: E402
+from cases_system import ALL, TO_LLM            # noqa: E402
+from cases_system_big import ALL_BIG, TO_LLM_BIG   # noqa: E402
+SYSTEM_CASES = ALL + TO_LLM + ALL_BIG + TO_LLM_BIG
 from ml_spec import norm              # noqa: E402
 
 
@@ -107,10 +110,10 @@ def selftest_parser(cases):
     return parse
 
 
-def load_real_parser():
+def load_real_parser(model_dir: str = ""):
     try:
         import ml_infer
-        return ml_infer.get_engine().predict_one
+        return ml_infer.Engine(model_dir).predict_one if model_dir else ml_infer.get_engine().predict_one
     except ImportError as exc:
         sys.exit(f"Не хватает пакета для модели: {exc}\nУстановите: pip install torch transformers")
     except Exception as exc:                      # нет папки модели и т.п.
@@ -129,6 +132,7 @@ def main(argv=None) -> int:
     ap.add_argument("--tsv", help="записать ошибки в этот файл в формате ml_real.tsv")
     ap.add_argument("--min-accuracy", type=float, default=0.0, help="код возврата 1, если доля ok ниже")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--model", default="", help="папка другой модели для сравнения (например ml/ml_model_new)")
     a = ap.parse_args(argv)
 
     cases = []
@@ -147,7 +151,7 @@ def main(argv=None) -> int:
     if not cases:
         sys.exit("Нет фраз под такой фильтр.")
 
-    parse = selftest_parser(cases) if a.selftest else load_real_parser()
+    parse = selftest_parser(cases) if a.selftest else load_real_parser(a.model)
     outcomes, times, fails = collections.defaultdict(list), [], []
     by_tag = collections.defaultdict(collections.Counter)
     for c in cases:

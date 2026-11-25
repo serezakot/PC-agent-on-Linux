@@ -1,4 +1,4 @@
-"""Тесты исполнителя (gogle_search.py) БЕЗ модели и без сети: модель подменяется «ответом по эталону».
+"""Тесты исполнителя (jarvis/browser.py) БЕЗ модели и без сети: модель подменяется «ответом по эталону».
 
 Запуск из корня проекта:
     python3 -m unittest discover -s tests -v          (или: python3 tests/test_executor.py)
@@ -6,8 +6,6 @@
     «загугли …»  -> страница результатов Google (в ссылке НЕТ btnI=1, «первый сайт» не открывается);
     «переведи …» -> Google Переводчик с подставленными текстом и языком.
 """
-import contextlib
-import io
 import sys
 import unittest
 from pathlib import Path
@@ -17,7 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 for p in (ROOT, ROOT / "ml", Path(__file__).resolve().parent):
     sys.path.insert(0, str(p))
 
-import gogle_search as g          # noqa: E402
+from jarvis import browser as g      # noqa: E402
+from jarvis.parser import ModelError   # noqa: E402
 import ml_spec                     # noqa: E402
 from cases import all_cases, expected_kind   # noqa: E402
 
@@ -237,9 +236,8 @@ def result(route, **kw):
 class TestHandlePhrase(unittest.TestCase):
     def run_phrase(self, res, net=None):
         net = net or FakeNet()
-        opened = []
-        out, plan = g.handle_phrase("фраза", lambda p: res, opened.append, net.resolver, net.finder)
-        return opened, plan
+        plan = g.plan_for(res, net.resolver, net.finder)
+        return ([plan.url] if plan else []), plan
 
     def test_translate_opens_translator(self):               # баг №1 из жалобы: «переведи» не открывал переводчик
         opened, plan = self.run_phrase(result("translate", text="как дела", lang="en"))
@@ -276,44 +274,12 @@ class TestHandlePhrase(unittest.TestCase):
         self.assertEqual(self.run_phrase(result("зачем")), ([], None))
 
     def test_parser_error_propagates(self):
+        from jarvis import dispatcher as assistant
+
         def boom(_):
-            raise g.ModelError("нет модели")
-        with self.assertRaises(g.ModelError):
-            g.handle_phrase("x", boom, lambda u: None)
-
-
-class TestRunCli(unittest.TestCase):
-    """_run — то, что видит пользователь в терминале (--dry-run: ссылка печатается, браузер не открывается)."""
-
-    def run_cli(self, res):
-        orig = g.model_parse
-        g.model_parse = lambda phrase: res
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                ok = g._run("любая фраза", lambda u: None, dry_run=True)
-        finally:
-            g.model_parse = orig
-        return ok, buf.getvalue()
-
-    def test_dry_run_translate_prints_translator_url(self):
-        ok, out = self.run_cli(result("translate", text="как дела", lang="de"))
-        self.assertTrue(ok)
-        self.assertIn("https://translate.google.com/?sl=auto&tl=de", out)
-
-    def test_dry_run_google_prints_results_url(self):
-        ok, out = self.run_cli(result("browser", query="рецепт борща"))
-        self.assertTrue(ok)
-        self.assertIn("https://www.google.com/search?q=", out)
-        self.assertNotIn("btnI", out)
-
-    def test_translate_nothing_to_translate(self):
-        _, out = self.run_cli(result("translate", text="", lang="en"))
-        self.assertIn("Переводить нечего", out)
-
-    def test_llm_message(self):
-        _, out = self.run_cli(result("llm", fallback=True, reason="не уверена в намерении (0.80)"))
-        self.assertIn("страховка", out)
+            raise ModelError("нет модели")
+        with self.assertRaises(ModelError):
+            assistant.dispatch_phrase("x", parser=boom, dry_run=True)
 
 
 class TestCorpus(unittest.TestCase):
@@ -364,9 +330,10 @@ class TestCorpus(unittest.TestCase):
         """Если модель вернула эталон, исполнитель обязан открыть ровно то, что нужно."""
         bad = []
         for c in self.cases:
-            net, opened = FakeNet(), []
+            net = FakeNet()
             res = result(c.route, site=c.site, query=c.query, text=c.text, lang=c.lang)
-            _, plan = g.handle_phrase(c.phrase, lambda p, res=res: res, opened.append, net.resolver, net.finder)
+            plan = g.plan_for(res, net.resolver, net.finder)
+            opened = [plan.url] if plan else []
             kind = expected_kind(c)
             if kind is None:
                 ok = plan is None and not opened

@@ -2,49 +2,28 @@
 через org.gnome.Mutter.RemoteDesktop, чтение горячих клавиш GNOME, MPRIS, яркость, точка входа make_system_plan / execute_system_plan."""
 from __future__ import annotations
 
-
-import datetime as dt
-import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import quote
 
-from app_launcher import (
-    _find_projects_dir,
-    _find_removable_media,
-    _latest_entry,
-    _norm,
-    _norm_stemmed,
-    find_local_item,
-    resolve_close_patterns,
-    xdg_user_dirs,
+from ..apps import (  # noqa: F401
+    _find_projects_dir, _find_removable_media, _latest_entry, _norm, _norm_stemmed, find_local_item,
+    resolve_close_patterns, xdg_user_dirs,
 )
-import time
 
-CLIPBOARD_STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "pc_agent_clipboard.json"
+# PC_AGENT_CLIPBOARD_FILE — отдельный файл и без системного буфера обмена (тесты не трогают буфер пользователя)
+CLIPBOARD_STATE_FILE = Path(os.environ.get("PC_AGENT_CLIPBOARD_FILE") or
+                            Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "pc_agent_clipboard.json")
+SYSTEM_CLIPBOARD = not os.environ.get("PC_AGENT_CLIPBOARD_FILE")
 KEY_LEFTMETA = 125
-KEY_DELETE = 111
 KEY_H = 35
 KEY_D = 32
-KEY_R = 19
-KEY_P = 25
-KEY_GRAVE = 41
-KEY_MINUS = 12
-KEY_EQUAL = 13
-KEY_0 = 11
-KEY_KP4 = 75
-KEY_KP5 = 76
-KEY_KP6 = 77
-KEY_KP2 = 80
-KEY_INSERT = 110
 
 
 class SystemCommandError(RuntimeError):
@@ -67,102 +46,72 @@ class SystemPlan:
 # =============================================================================
 # 1. Вспомогательные парсеры аргументов (проценты, секунды, минуты, пути)
 # =============================================================================
-_WORD_NUMBERS: tuple[tuple[str, int], ...] = (
-    ("сто", 100),
-    ("максимум", 100),
-    ("полную", 100),
-    ("девяносто пять", 95),
-    ("девяносто", 90),
-    ("восемьдесят пять", 85),
-    ("восемьдесят", 80),
-    ("семьдесят пять", 75),
-    ("семьдесят", 70),
-    ("шестьдесят пять", 65),
-    ("шестьдесят", 60),
-    ("пятьдесят пять", 55),
-    ("пятьдесят", 50),
-    ("полтинник", 50),
-    ("половину", 50),
-    ("наполовину", 50),
-    ("сорок пять", 45),
-    ("сорок", 40),
-    ("тридцать пять", 35),
-    ("тридцать", 30),
-    ("полминуты", 30),
-    ("двадцать пять", 25),
-    ("двадцать", 20),
-    ("пятнадцать", 15),
-    ("двенадцать", 12),
-    ("десять", 10),
-    ("семь", 7),
-    ("пять", 5),
-    ("минимум", 5),
-    ("три", 3),
-    ("две", 2),
-    ("два", 2),
-    ("одну", 1),
-    ("один", 1),
-    ("ноль", 0),
-)
+# --- Числа словами -> цифры: «двадцать пять» -> 25, «до тридцати» -> 30, «тысяча девятьсот двадцать» -> 1920 (знание языка,
+# не фразы; общее для исполнителей и голосового ввода — jarvis/spoken.py) ---
+from ..spoken import words_to_digits  # noqa: E402,F401
+
+
+_PERCENT_WORDS = (("максимум", 100), ("полную", 100), ("полностью", 100), ("минимум", 5), ("половину", 50), ("половина", 50),
+                  ("четверть", 25), ("треть", 33))
 
 
 def _parse_percent(query: str, default: int | None = None) -> int | None:
-    """Извлекает число процентов (0..100) из аргумента `query`."""
-    q_norm = _norm(query)
-    if not q_norm:
+    """Число процентов (0..100) из аргумента: «30», «двадцать пять процентов», «на максимум», «150» -> 100."""
+    q = words_to_digits(query)
+    if not q:
         return default
-    m = re.search(r"\b(\d{1,3})\b", q_norm)
+    m = re.search(r"(?<![\d.])(\d{1,4})(?![\d.])", q)
     if m:
-        val = int(m.group(1))
-        if 0 <= val <= 100:
-            return val
-    for word, val in _WORD_NUMBERS:
-        if re.search(rf"\b{re.escape(word)}\b", q_norm):
+        return max(0, min(100, int(m.group(1))))
+    for word, val in _PERCENT_WORDS:
+        if re.search(rf"\b{word}\b", q):
             return val
     return default
+
+
+_UNIT_SECONDS = (("сек", 1), ("мин", 60), ("час", 3600))
+
+
+def parse_duration(query: str, bare_unit: int = 60) -> int | None:
+    """Длительность в секундах: «10 минут», «полтора часа», «1 час 30 минут», «две с половиной минуты», «минуту тридцать»,
+    «двадцать пять минут». Число без единицы считается в bare_unit секунд (60 — минуты, 1 — секунды)."""
+    q = _norm(query).replace("ё", "е")
+    if not q:
+        return None
+    q = q.replace("полчаса", "30 минут").replace("полминуты", "30 секунд")
+    q = words_to_digits(q)
+    # единица без числа = одна единица: «минуту», «час», но не «1 минуту» / «2 часа»
+    q = re.sub(r"(?<![\d.] )(?<![\d.])\b(?:минуту|минутку|минуточку)\b", "1 минута", q)
+    q = re.sub(r"(?<![\d.] )(?<![\d.])\bчас\b", "1 час", q)
+    q = re.sub(r"(?<![\d.] )(?<![\d.])\bсекунду\b", "1 секунда", q)
+    q = re.sub(r"(\d+) с половиной", lambda m: f"{m.group(1)}.5", q)
+    total, found, last_unit = 0.0, False, None
+    for m in re.finditer(r"(\d+(?:[.,]\d+)?)\s*(?:и\s+)?(сек\w*|мин\w*|час\w*)?", q):
+        num = float(m.group(1).replace(",", "."))
+        unit = m.group(2)
+        if unit:
+            mult = next(v for k, v in _UNIT_SECONDS if unit.startswith(k))
+        elif last_unit == 3600:
+            mult = 60                       # «час двадцать» -> 1 ч 20 мин
+        elif last_unit == 60:
+            mult = 1                        # «минуту тридцать» -> 1 мин 30 сек
+        else:
+            mult = bare_unit
+        total += num * mult
+        found, last_unit = True, mult
+    return int(round(total)) if found and total > 0 else None
 
 
 def _parse_seconds(query: str, default: int = 10) -> int:
-    """Извлекает количество секунд для перемотки из аргумента `query`."""
-    q_norm = _norm(query)
-    if not q_norm:
-        return default
-    if "две минуты" in q_norm or "2 минуты" in q_norm:
-        return 120
-    if "минуту" in q_norm or "1 минуту" in q_norm:
-        return 60
-    if "полминуты" in q_norm:
-        return 30
-    m = re.search(r"\b(\d{1,4})\b", q_norm)
-    if m:
-        return max(1, int(m.group(1)))
-    for word, val in _WORD_NUMBERS:
-        if re.search(rf"\b{re.escape(word)}\b", q_norm) and val > 0:
-            return val
-    return default
+    """Секунды для перемотки: «20 секунд», «три минуты», «полторы минуты», «минуту тридцать»; голое число — секунды."""
+    secs = parse_duration(query, bare_unit=1)
+    return max(1, secs) if secs else default
 
 
 def _parse_delay_minutes(query: str, default: int = 10) -> int:
-    """Извлекает количество минут для таймера выключения/перезагрузки/блокировки."""
-    q_norm = _norm(query)
-    if not q_norm:
-        return default
-    for phrase, mins in (
-        ("полтора часа", 90), ("два часа", 120), ("2 часа", 120), ("три часа", 180),
-        ("час", 60), ("1 час", 60), ("полчаса", 30),
-        ("сорок пять минут", 45), ("тридцать минут", 30), ("двадцать минут", 20),
-        ("пятнадцать минут", 15), ("двенадцать минут", 12), ("десять минут", 10),
-        ("семь минут", 7), ("пять минут", 5), ("три минуты", 3), ("две минуты", 2), ("минуту", 1),
-    ):
-        if phrase in q_norm:
-            return mins
-    m_hr = re.search(r"(\d+)\s*(?:час)", q_norm)
-    if m_hr:
-        return max(1, int(m_hr.group(1)) * 60)
-    m = re.search(r"(\d+)", q_norm)
-    if m:
-        return max(1, int(m.group(1)))
-    return default
+    """Минуты задержки для выключения / перезагрузки / сна: «через 3 часа», «через двадцать пять минут»; голое число — минуты."""
+    secs = parse_duration(query, bare_unit=60)
+    return max(1, round(secs / 60)) if secs else default
 
 
 # =============================================================================
@@ -191,9 +140,6 @@ KEY_LEFTALT = 56
 KEY_SPACE = 57
 KEY_F4 = 62
 KEY_F5 = 63
-KEY_F8 = 66
-KEY_F9 = 67
-KEY_F10 = 68
 KEY_F11 = 87
 KEY_SYSRQ = 99
 KEY_HOME = 102
@@ -202,7 +148,6 @@ KEY_PAGEUP = 104
 KEY_LEFT = 105
 KEY_RIGHT = 106
 KEY_END = 107
-KEY_DOWN = 108
 KEY_PAGEDOWN = 109
 KEY_SUPER = 125
 KEY_NEXTSONG = 163
@@ -477,7 +422,7 @@ _REMINDER_TEXT: dict[str, str] = {}
 
 def name_similarity_safe(a: str, b: str) -> float:
     try:
-        from app_launcher import name_similarity
+        from ..apps import name_similarity
         return name_similarity(a, b)
     except Exception:
         return 0.0
@@ -491,7 +436,6 @@ def make_system_plan(
     home: Path | None = None,
     action: str = "",
     site: str = "",
-    raw_phrase: str = "",
     text: str = "",
 ) -> SystemPlan | None:
     """Строит план выполнения системной команды Ubuntu 24.04 LTS по `(action, query, site, text)` от модели.
@@ -504,7 +448,15 @@ def make_system_plan(
 
     home = home or Path.home()
     dirs = xdg_user_dirs(home)
-    return handler(query, site, home, dirs)
+    try:
+        return handler(query, site, home, dirs)
+    except (SystemCommandError, OSError) as exc:
+        # Обработчик отказался (путь вне дома, слишком длинное имя...): честный план «не могу», а не падение ассистента
+        reason = str(exc) if isinstance(exc, SystemCommandError) else f"ошибка файловой системы ({exc.strerror or exc})"
+
+        def _refuse() -> str:
+            raise SystemCommandError(reason)
+        return SystemPlan(category="refused", action=action, description=f"Не выполняю: {reason}", commands=(), python_op=_refuse)
 
 
 def _run_cmd_sequence(cmds: tuple[tuple[str, ...], ...]) -> bool:
